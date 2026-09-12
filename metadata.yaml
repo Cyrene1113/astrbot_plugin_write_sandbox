@@ -1,0 +1,14 @@
+name: astrbot_plugin_write_sandbox
+display_name: 写作沙盒 · 昔涟
+desc: ✍️ 委托式独立写作沙盒。汐小姐用自然语言吩咐，插件以独立上下文+风格卡+约束在后台分节生成文字，逐节落盘为 txt，完成后自动推送。与主聊天完全隔离、互不打扰。
+help: 无需指令。直接对昔涟说“写一段……”即可，插件会后台分节产出并保存为 txt，写完自动通知。
+version: 0.2.0
+author: 昔涟
+repo: https://github.com/your-repo/write-sandbox
+tags:
+  - 写作
+  - 沙盒
+  - 昔涟
+  - 创作
+  - 私聊插件
+  - 风格学习
