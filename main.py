@@ -35,7 +35,10 @@ from .prompts import (
     build_chapter_summary_prompt,
     build_story_state_prompt,
     build_outline_prompt,
+    build_outline_revise_prompt,
     build_character_prompt,
+    build_character_extract_prompt,
+    build_global_card_select_prompt,
 )
 
 PLUGIN_ID = "astrbot_plugin_write_sandbox"
@@ -131,6 +134,19 @@ class WriteSandboxPlugin(Star):
                 return h["content"][-max_chars:]
         return ""
 
+    def _build_continue_context(self, sandbox: Sandbox, work: str, ch: int) -> str:
+        """长文续写时按作品章节接续设置决定上下文：
+        continuous 贴上一章结尾三行；break 只给本章氛围引子；auto 有引子则断章式、否则贴结尾。"""
+        mode = sandbox.get_chapter_link_mode(work)
+        prev_tail = sandbox.read_chapter_tail(work, ch - 1) if ch > 1 else ""
+        mood = sandbox.render_chapter_mood(work, ch)
+        if mode == "break":
+            return mood or ""
+        if mode == "continuous":
+            return prev_tail or mood or self._last_assistant_output(sandbox)
+        # auto：有灵感便签/结尾钩子就断章式，否则贴上一章结尾
+        return mood or prev_tail or self._last_assistant_output(sandbox)
+
     def _apply_banned_words(self, text: str, sandbox: Sandbox) -> str:
         banned = sandbox.constraints.get("banned_words") or []
         for w in banned:
@@ -141,7 +157,7 @@ class WriteSandboxPlugin(Star):
     # ═══════════════════════════════════════════
     # 工具 1：沙盒写作（生成 / 续写 / 改写）
     # ═══════════════════════════════════════════
-    @filter.llm_tool(name="沙盒写作")
+    @filter.llm_tool(name="sandbox_write")
     async def sandbox_write(
         self,
         event: AstrMessageEvent,
@@ -156,7 +172,7 @@ class WriteSandboxPlugin(Star):
         或要求「按我的素材风格写」「续写/改写上一段」时调用本工具。
         长篇模式：用户提到作品名（如「写《雾都夜行》第3章」）时把作品名传入 work，
         正文会存进该作品的章节目录，并自动生成章节摘要、更新设定书。
-        长文会自动分成每节约 4000 字的小节在后台逐节写；用户中途问进度时调用「沙盒进度」工具。
+        长文会自动分成每节约 4000 字的小节在后台逐节写；用户中途问进度时调用 sandbox_progress 工具。
 
         Args:
             instruction(string): 用户想要的内容描述，例如「她推门进来，雨还没干」「尺度拉高，重点写触感」。
@@ -175,6 +191,24 @@ class WriteSandboxPlugin(Star):
             active_work = sandbox.set_active_work(work.strip())
         else:
             active_work = sandbox.get_active_work() or ""
+
+        # 长篇模式：有未确认的大纲草稿先拦下，避免「大纲没过目就直接开写」
+        if active_work and sandbox.has_pending_outline(active_work):
+            return (
+                f"《{active_work}》还有一份大纲草稿没确认呢，"
+                "先审核一下再写正文——确认后人家马上开工♪\n\n"
+                + sandbox.render_pending_outline(active_work)
+            )
+
+        # 长篇模式：写正文前复核人物卡，发现旧卡残留/缺卡/无关信息就随启动消息提示
+        char_audit_note = ""
+        if active_work:
+            try:
+                rep = sandbox.render_character_audit(active_work)
+                if "没有发现" not in rep:
+                    char_audit_note = "\n\n【写前人物卡复核】\n" + rep + "\n（可以先让人家清理旧卡或补建缺卡，也可以直接开写♪）"
+            except Exception:
+                pass
 
         # 长篇模式下先确定章节号（generate=新章，continue/rewrite=续写最近一章）
         chapter_no = 0
@@ -222,6 +256,8 @@ class WriteSandboxPlugin(Star):
         if active_work:
             lines.append(f"作品：《{active_work}》第{chapter_no}章")
         lines.append("人家在后台一节一节写，全部写完会把完整文件推给你，中途想知道进度随时问人家♪")
+        if char_audit_note:
+            lines.append(char_audit_note)
         return "\n".join(lines)
 
     # ── 后台写作任务 ────────────────────────────
@@ -336,6 +372,14 @@ class WriteSandboxPlugin(Star):
             work_chars = sandbox.render_work_characters(work, ch) if work else ""
             if work_chars:
                 story_context = (story_context + "\n\n" + work_chars) if story_context else work_chars
+            # 全局卡智能选角：按本章剧情需要自动挑选，不点名、不全带
+            if work:
+                try:
+                    picked = await self._select_global_cards(sandbox, work, ch, instruction, chapter_outline)
+                    if picked:
+                        story_context = (story_context + "\n\n" + picked) if story_context else picked
+                except Exception as e:
+                    logger.warning(f"全局卡智能选角失败，跳过: {e}")
             parts_written: list[str] = []
             file_path = None
 
@@ -366,8 +410,23 @@ class WriteSandboxPlugin(Star):
                     summary = full[:200]
                 sandbox.upsert_chapter_summary(work, ch, summary)
                 await self._update_story_state(sandbox, work, full, ch)
+                # 自动提炼人设卡：按出现次数/置信度判断，达标且无同名卡才建卡
+                try:
+                    created = await self._auto_extract_characters(sandbox, work, full)
+                    if created:
+                        job["extract_report"] = "、".join(created)
+                except Exception as e:
+                    logger.warning(f"自动提炼人设卡失败: {e}")
 
             job["status"] = "done"
+            # 口水词小哨兵：整章/整段完成后自动扫一遍重复词，随通知附上
+            try:
+                full_text = "\n\n".join(parts_written)
+                repeat_report = sandbox.detect_repeated_words(full_text, work=work)
+                if repeat_report:
+                    job["repeat_report"] = repeat_report
+            except Exception as e:
+                logger.warning(f"口水词检测失败: {e}")
             await self._notify(job, failed=False)
         except Exception as e:
             logger.error(f"后台写作任务 {job.get('job_id')} 异常: {e}")
@@ -379,6 +438,49 @@ class WriteSandboxPlugin(Star):
                 pass
         finally:
             job["finished_at"] = time.time()
+
+    async def _select_global_cards(
+        self,
+        sandbox: Sandbox,
+        work: str,
+        ch: int,
+        instruction: str,
+        chapter_outline: str,
+    ) -> str:
+        """从全局卡池里挑本章真正需要的卡，返回注入文本；失败/无选择返回空串。"""
+        pool = sandbox.render_global_card_pool(work, ch)
+        if not pool:
+            return ""
+        chapter_info = chapter_outline or f"（第 {ch} 章，暂无详细大纲）"
+        chapter_info += f"\n用户写作要求：{instruction[:300]}"
+        prompt = build_global_card_select_prompt(chapter_info=chapter_info, pool=pool)
+        raw = await self._llm_chat(prompt, system_prompt="你只输出 JSON，不要输出任何其他文字。")
+        raw = self._clean(raw)
+        selected: list[str] = []
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                selected = parsed.get("selected") or []
+        except Exception:
+            m = re.search(r"\{.*\}", raw, re.S)
+            if m:
+                try:
+                    parsed = json.loads(m.group(0))
+                    if isinstance(parsed, dict):
+                        selected = parsed.get("selected") or []
+                except Exception:
+                    pass
+        names = [str(n).strip() for n in selected if str(n).strip()][:3]
+        if not names:
+            return ""
+        cards: list[str] = []
+        for n in names:
+            card = sandbox.load_character(n, work)
+            if card:
+                cards.append(sandbox.render_character(card))
+        if not cards:
+            return ""
+        return "【本章选用全局人设卡（经选角判断自动引入）】\n" + "\n\n".join(cards)
 
     async def _write_section(
         self,
@@ -392,6 +494,8 @@ class WriteSandboxPlugin(Star):
         sandbox: Sandbox = job["sandbox"]
         instruction = job["instruction"]
         mode = job["mode"]
+        work = job.get("work") or ""
+        ch = int(job.get("chapter_no") or 0)
         history = sandbox.load_history()
         history_text = "\n".join(
             f"{'用户' if h['role'] == 'user' else '沙盒'}: {h['content'][:300]}"
@@ -434,10 +538,13 @@ class WriteSandboxPlugin(Star):
 
         if idx == 1:
             if mode == "continue":
-                last_output = self._last_assistant_output(sandbox)
-                if last_output:
+                if work:
+                    link_ctx = self._build_continue_context(sandbox, work, ch)
+                else:
+                    link_ctx = self._last_assistant_output(sandbox)
+                if link_ctx:
                     prompt = (
-                        build_context_snippet("续写这一段，保持风格与设定一致", last_output)
+                        build_context_snippet("续写这一段，保持风格与设定一致", link_ctx)
                         + "\n\n续写要求：" + instruction + section_note
                     )
                 else:
@@ -525,6 +632,10 @@ class WriteSandboxPlugin(Star):
                     )
                 else:
                     body += f"全文（共 {job.get('section_total')} 节）写完啦，已保存：{job.get('file_path')}"
+                if job.get("extract_report"):
+                    body += f"\n\n【自动提炼人设卡】{job['extract_report']}"
+                if job.get("repeat_report"):
+                    body += "\n\n" + job["repeat_report"]
                 chunk = job.get("current_chunk") or ""
                 if chunk:
                     body += "\n\n【末尾节选】\n" + chunk[-400:]
@@ -536,7 +647,7 @@ class WriteSandboxPlugin(Star):
     # ═══════════════════════════════════════════
     # 工具 1.5：沙盒进度（后台任务状态查询）
     # ═══════════════════════════════════════════
-    @filter.llm_tool(name="沙盒进度")
+    @filter.llm_tool(name="sandbox_progress")
     async def sandbox_progress(
         self,
         event: AstrMessageEvent,
@@ -561,7 +672,7 @@ class WriteSandboxPlugin(Star):
     # ═══════════════════════════════════════════
     # 工具 1.6：沙盒取消（中断后台写作任务）
     # ═══════════════════════════════════════════
-    @filter.llm_tool(name="沙盒取消")
+    @filter.llm_tool(name="sandbox_cancel")
     async def sandbox_cancel(
         self,
         event: AstrMessageEvent,
@@ -634,10 +745,97 @@ class WriteSandboxPlugin(Star):
         sandbox.save_story_state(work, state)
         return "（设定书已更新）"
 
+    async def _extract_characters(self, text: str) -> list[dict]:
+        """统计正文角色出现频次与置信度；返回角色列表（已按提示词判定线过滤）。"""
+        prompt = build_character_extract_prompt(text=text[:6000])
+        raw = await self._llm_chat(prompt, system_prompt="你只输出 JSON，不要输出任何其他文字。")
+        raw = self._clean(raw)
+        data = None
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                data = parsed
+        except Exception:
+            m = re.search(r"\{.*\}", raw, re.S)
+            if m:
+                try:
+                    parsed = json.loads(m.group(0))
+                    if isinstance(parsed, dict):
+                        data = parsed
+                except Exception:
+                    pass
+        if not data:
+            return []
+        items = data.get("characters") or []
+        chars: list[dict] = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            name = str(it.get("name") or "").strip()
+            if not name:
+                continue
+            chars.append({
+                "name": name,
+                "aliases": [str(a) for a in (it.get("aliases") or []) if str(a)],
+                "mention_count": int(it.get("mention_count") or 0),
+                "sections_involved": int(it.get("sections_involved") or 0),
+                "confidence": float(it.get("confidence") or 0),
+                "role_hint": str(it.get("role_hint") or "配角"),
+                "traits": str(it.get("traits") or ""),
+            })
+        return chars
+
+    async def _auto_extract_characters(self, sandbox: Sandbox, work: str, full_text: str) -> list[str]:
+        """整章写完后的自动提炼：置信度达标且无同名卡才建卡，返回新建卡名列表。"""
+        try:
+            chars = await self._extract_characters(full_text)
+        except Exception as e:
+            logger.warning(f"自动提炼角色统计失败: {e}")
+            return []
+        created: list[str] = []
+        reference = sandbox.render_story_memory(work)[:1500]
+        for c in chars:
+            nm = str(c.get("name") or "").strip()
+            if not nm or c.get("confidence", 0) < 0.45 or c.get("mention_count", 0) < 2:
+                continue
+            if sandbox.load_character(nm, work):
+                continue
+            role_hint = str(c.get("role_hint") or "配角")
+            traits = str(c.get("traits") or "").strip()
+            desc = f"{nm}，{role_hint}。{traits}" if traits else f"{nm}，{role_hint}。"
+            try:
+                prompt = build_character_prompt(description=desc, reference=reference)
+                raw = await self._llm_chat(prompt, system_prompt="你只输出 JSON，不要输出任何其他文字。")
+                card = None
+                raw = self._clean(raw)
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict):
+                        card = parsed
+                except Exception:
+                    m = re.search(r"\{.*\}", raw, re.S)
+                    if m:
+                        try:
+                            parsed = json.loads(m.group(0))
+                            if isinstance(parsed, dict):
+                                card = parsed
+                        except Exception:
+                            pass
+                if card is None:
+                    continue
+                basic = card.get("basic") if isinstance(card.get("basic"), dict) else {}
+                basic["name"] = nm
+                card["basic"] = basic
+                sandbox.save_character(card, "work", work)
+                created.append(nm)
+            except Exception as e:
+                logger.warning(f"自动提炼角色卡「{nm}」失败: {e}")
+        return created
+
     # ═══════════════════════════════════════════
     # 工具 2：沙盒设置（调整约束，立即生效）
     # ═══════════════════════════════════════════
-    @filter.llm_tool(name="沙盒设置")
+    @filter.llm_tool(name="sandbox_settings")
     async def sandbox_set(
         self,
         event: AstrMessageEvent,
@@ -662,7 +860,7 @@ class WriteSandboxPlugin(Star):
     # ═══════════════════════════════════════════
     # 工具 3：沙盒收藏（满意段落进入 favorites/）
     # ═══════════════════════════════════════════
-    @filter.llm_tool(name="沙盒收藏")
+    @filter.llm_tool(name="sandbox_favorite")
     async def sandbox_favorite(
         self,
         event: AstrMessageEvent,
@@ -687,7 +885,7 @@ class WriteSandboxPlugin(Star):
     # ═══════════════════════════════════════════
     # 工具 4：沙盒学习素材（提炼风格卡）
     # ═══════════════════════════════════════════
-    @filter.llm_tool(name="沙盒学习素材")
+    @filter.llm_tool(name="sandbox_learn")
     async def sandbox_learn(
         self,
         event: AstrMessageEvent,
@@ -750,14 +948,25 @@ class WriteSandboxPlugin(Star):
             meta["favorite_ratio"] = round(len(favs) / (len(favs) + len(libs)), 2)
         card["meta"] = meta
 
+        # 修复：学习结果直接存入风格卡库存（style_cards/），可被 sandbox_style_combo 点名；
+        # 同时保留「学了即用」，同步设为当前主卡。
+        card_name = name.strip() or f"风格_{time.strftime('%m%d_%H%M%S')}"
+        sandbox.save_style_card_to_library(card_name, card)
         sandbox.style_card = card
         sandbox.save_style_card()
-        return "风格学习完成♪ 当前风格卡：\n" + sandbox.render_style_card()
+        lines = [
+            f"风格学习完成♪ 已入库存为「{card_name}」并设为当前主卡。",
+            "卡库现有：" + ("、".join(sandbox.list_style_cards()) or "（空）"),
+            "",
+            "【当前风格卡】",
+            sandbox.render_style_card(),
+        ]
+        return "\n".join(lines)
 
     # ═══════════════════════════════════════════
     # 工具 5：沙盒状态
     # ═══════════════════════════════════════════
-    @filter.llm_tool(name="沙盒状态")
+    @filter.llm_tool(name="sandbox_status")
     async def sandbox_status(
         self,
         event: AstrMessageEvent,
@@ -792,7 +1001,7 @@ class WriteSandboxPlugin(Star):
     # ═══════════════════════════════════════════
     # 工具 5.2：沙盒风格组合（多卡融合 + 维度指定）
     # ═══════════════════════════════════════════
-    @filter.llm_tool(name="沙盒风格组合")
+    @filter.llm_tool(name="sandbox_style_combo")
     async def sandbox_style_combo(
         self,
         event: AstrMessageEvent,
@@ -869,7 +1078,7 @@ class WriteSandboxPlugin(Star):
     # ═══════════════════════════════════════════
     # 工具 5.5：沙盒作品（长篇工作区管理）
     # ═══════════════════════════════════════════
-    @filter.llm_tool(name="沙盒作品")
+    @filter.llm_tool(name="sandbox_work")
     async def sandbox_work(
         self,
         event: AstrMessageEvent,
@@ -926,7 +1135,7 @@ class WriteSandboxPlugin(Star):
     # ═══════════════════════════════════════════
     # 工具 5.6：沙盒大纲（作品大纲 JSON：全局脉络 + 分章节点）
     # ═══════════════════════════════════════════
-    @filter.llm_tool(name="沙盒大纲")
+    @filter.llm_tool(name="sandbox_outline")
     async def sandbox_outline(
         self,
         event: AstrMessageEvent,
@@ -934,17 +1143,27 @@ class WriteSandboxPlugin(Star):
         action: str = "write",
         work: str = "",
         name: str = "",
+        ch: int = 0,
+        text: str = "",
+        link_mode: str = "",
     ) -> str:
-        """为长篇作品编写/重写/查看大纲（JSON：全局脉络 + 分章节点）。
+        """为长篇作品编写/确认/丢弃/查看大纲，管理章节接续与灵感便签（JSON：全局脉络 + 分章节点）。
 
         当用户说「给《XX》定个大纲」「规划一下剧情」「看看大纲」时调用。
-        大纲存到当前作品的 outline.json；写正文时自动注入当前章节的大纲节点。
+        大纲生成后先存为**待确认草稿**，不直接落盘生效；用户看完说可以/确认后，
+        再用 action=confirm 落盘为正式 outline.json。写正文前若存在未确认草稿会先拦截。
+        action=discard 丢弃草稿；action=view 优先展示待确认草稿（带提示），无草稿才展示正式大纲。
+        action=note 给某章挂灵感便签（ch + text，写该章时自动注入）；action=clearnote 清空某章便签。
+        action=link 设置章节接续模式（link_mode=continuous 贴上一章结尾 / break 只给氛围引子 / auto 自动）。
 
         Args:
             instruction(string): 大纲要求，如「十章，涩涩密度前期暧昧后期露骨，结局留白」。
-            action(string): write=新建/覆盖大纲（默认）；rewrite=按新要求重写；view=查看当前作品大纲。
+            action(string): write=生成草稿（默认）；revise=基于现有大纲微调（局部修改不推倒重来）；confirm=确认草稿落盘；discard=丢弃草稿；view=查看；note=挂灵感便签；clearnote=清空便签；link=设置章节接续。
             work(string): 可选，作品名。传入则切换/新建该作品；留空沿用当前激活作品。
             name(string): 兼容旧参数名，等价于 work。
+            ch(int): note/clearnote 时指定章节号。
+            text(string): note 时的灵感便签内容。
+            link_mode(string): link 时设置 continuous/break/auto。
         """
         sandbox = self._get_sandbox(event)
         if not sandbox:
@@ -957,7 +1176,95 @@ class WriteSandboxPlugin(Star):
         if not active:
             return "当前没有激活的作品。先指定作品名，例如「给《雾都夜行》定个大纲」。"
         if action == "view":
+            if sandbox.has_pending_outline(active):
+                return (
+                    "（当前有未确认的大纲草稿，先确认或丢弃）\n\n"
+                    + sandbox.render_pending_outline(active)
+                )
             return sandbox.render_outline(active)
+        if action == "confirm":
+            if sandbox.confirm_outline(active):
+                return f"大纲已确认落盘《{active}》♪\n\n" + sandbox.render_outline(active)
+            return "当前没有待确认的大纲草稿，先写一份再确认。"
+        if action == "discard":
+            if sandbox.has_pending_outline(active):
+                sandbox.discard_pending_outline(active)
+                return f"已丢弃《{active}》的大纲草稿，正式大纲保持原样。"
+            return "当前没有待丢弃的大纲草稿。"
+        if action == "note":
+            if not ch or ch < 1:
+                return "note 需要指定章节号 ch。"
+            if not text.strip():
+                return "note 需要便签内容 text，例如「雨夜、便利店、旧伞」。"
+            if sandbox.add_outline_mood(active, ch, text):
+                return f"已给《{active}》第{ch}章挂上灵感便签♪\n\n" + sandbox.render_chapter_outline(active, ch)
+            return f"大纲里还没有第{ch}章的节点，先确认大纲再挂便签。"
+        if action == "clearnote":
+            if not ch or ch < 1:
+                return "clearnote 需要指定章节号 ch。"
+            if sandbox.clear_outline_mood(active, ch):
+                return f"已清空《{active}》第{ch}章的灵感便签♪"
+            return f"大纲里没有第{ch}章的节点或便签。"
+        if action == "link":
+            mode = link_mode.strip().lower()
+            if mode not in ("continuous", "break", "auto"):
+                return "link 需要 link_mode=continuous（贴上一章结尾）/ break（只给氛围引子）/ auto（自动）。"
+            result = sandbox.set_chapter_link_mode(active, mode)
+            label = {
+                "continuous": "连续叙事：续写时贴上一章结尾三行，维持连贯",
+                "break": "断章收尾：续写不贴旧结尾，只给本章氛围引子",
+                "auto": "自动：有灵感便签/结尾钩子就断章式，否则贴上一章结尾",
+            }[result]
+            return f"《{active}》章节接续已设为「{result}」♪\n{label}"
+        if action == "revise":
+            current = sandbox.load_outline(active)
+            if not current.get("chapters"):
+                return f"《{active}》还没有正式大纲，先写一份再微调（用 action=write）。"
+            if not instruction.strip():
+                return "微调大纲需要说明改哪里，例如「把第3章改成雨夜重逢，删掉陆岑的戏份，新增一个女管家角色」。"
+            prompt = build_outline_revise_prompt(
+                instruction=instruction,
+                current_outline=json.dumps(current, ensure_ascii=False, indent=2),
+                reference=sandbox.render_story_memory(active)[:3000],
+            )
+            raw = await self._llm_chat(prompt, system_prompt="你只输出 JSON，不要输出任何其他文字。")
+            raw = self._clean(raw)
+            outline: Optional[dict] = None
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    outline = parsed
+            except Exception:
+                m = re.search(r"\{.*\}", raw, re.S)
+                if m:
+                    try:
+                        parsed = json.loads(m.group(0))
+                        if isinstance(parsed, dict):
+                            outline = parsed
+                    except Exception:
+                        pass
+            if outline is None:
+                return "大纲微调解析失败了，请再试一次，或换个说法描述调整要求。"
+            meta = outline.get("meta") if isinstance(outline.get("meta"), dict) else {}
+            meta["title"] = meta.get("title") or active
+            outline["meta"] = meta
+            if not isinstance(outline.get("chapters"), list):
+                outline["chapters"] = []
+            sandbox.save_pending_outline(active, outline)
+            n = len(outline["chapters"])
+            audit_note = ""
+            try:
+                rep = sandbox.render_character_audit(active)
+                if "没有发现" not in rep:
+                    audit_note = "\n\n【微调后人物卡复核】\n" + rep + "\n（确认大纲后记得清理旧卡/补建缺卡♪）"
+            except Exception:
+                pass
+            return (
+                f"《{active}》大纲微调草稿已生成（共 {n} 个章节节点），"
+                "先审核一下，确认后人家再落盘生效：\n\n"
+                + sandbox.render_pending_outline(active)
+                + audit_note
+            )
         if not instruction.strip():
             return "写大纲需要说明要求，例如「十章，暧昧转露骨，主角身世是核心悬念」。"
         prompt = build_outline_prompt(
@@ -987,14 +1294,18 @@ class WriteSandboxPlugin(Star):
         outline["meta"] = meta
         if not isinstance(outline.get("chapters"), list):
             outline["chapters"] = []
-        sandbox.save_outline(active, outline)
+        sandbox.save_pending_outline(active, outline)
         n = len(outline["chapters"])
-        return f"大纲已保存到《{active}》（共 {n} 个章节节点）♪\n\n" + sandbox.render_outline(active)
+        return (
+            f"《{active}》大纲草稿已生成（共 {n} 个章节节点），"
+            "先审核一下，确认后人家再落盘生效：\n\n"
+            + sandbox.render_pending_outline(active)
+        )
 
     # ═══════════════════════════════════════════
     # 工具 5.7：沙盒人设（统一格式人设卡，全局/作品双存储）
     # ═══════════════════════════════════════════
-    @filter.llm_tool(name="沙盒人设")
+    @filter.llm_tool(name="sandbox_character")
     async def sandbox_character(
         self,
         event: AstrMessageEvent,
@@ -1010,7 +1321,7 @@ class WriteSandboxPlugin(Star):
         「看看有哪些人设卡」时调用。生成后写正文时，会按大纲章节节点的出场角色自动注入人设卡。
 
         Args:
-            action(string): create=按描述生成新卡（默认）；list=列出可用卡；view=查看指定卡；update=按新描述重写指定卡；delete=删除指定卡。
+            action(string): create=按描述生成新卡（默认）；list=列出可用卡；view=查看指定卡；update=按新描述重写指定卡；delete=删除指定卡；audit=复核当前作品人物卡与大纲一致性（找旧卡残留/缺卡/无关信息）。
             description(string): create/update 时必填，一句话角色描述，如「夜总会老板，表面和气，背地里是情报贩子，右眼角有疤」。
             name(string): view/update/delete 时必填，角色名。
             scope(string): global=存全局（跨作品可调）；work=存当前作品（默认，仅本作品可见）。
@@ -1056,6 +1367,11 @@ class WriteSandboxPlugin(Star):
                 return f"已删除人设卡「{name.strip()}」（{scope}）♪"
             return f"没有找到可删除的「{name.strip()}」（{scope}）。"
 
+        if action == "audit":
+            if not active:
+                return "复核人物卡需要先激活一个作品（给 work 参数或先激活）。"
+            return sandbox.render_character_audit(active)
+
         # create / update
         if not description.strip():
             return "生成人设卡需要角色描述，例如「夜总会老板，表面和气，背地里是情报贩子」。"
@@ -1088,12 +1404,214 @@ class WriteSandboxPlugin(Star):
             basic["name"] = name.strip()
         card["basic"] = basic
         sandbox.save_character(card, scope, active)
-        return f"人设卡已保存♪（{scope}）\n\n" + sandbox.render_character(card)
+        extra = ""
+        if active:
+            foreign = sandbox.check_card_foreign(card, active)
+            if foreign:
+                extra = (
+                    "\n\n⚠️ 这张卡疑似夹带名单外人物关联（故事里未出场/未提到）："
+                    + "、".join(f"「{f}」" for f in foreign)
+                    + "\n要不要人家把卡改一下，清掉这些关联？"
+                )
+        return f"人设卡已保存♪（{scope}）\n\n" + sandbox.render_character(card) + extra
+
+    # ═══════════════════════════════════════════
+    # 工具 5.8：沙盒提炼角色（按频次/置信度自动建人设卡）
+    # ═══════════════════════════════════════════
+    @filter.llm_tool(name="sandbox_extract_characters")
+    async def sandbox_extract_characters(
+        self,
+        event: AstrMessageEvent,
+        source: str = "recent",
+        text: str = "",
+        scope: str = "work",
+        work: str = "",
+        min_confidence: str = "0.45",
+    ) -> str:
+        """从文本/素材/作品章节中统计角色戏份，出现次数与置信度达标的自动提炼成人设卡并保存。
+
+        当用户说「把这几章的角色提成人设卡」「从这段文字里提取角色」「给戏份多的角色建卡」时调用。
+        判断机制：模型评估每个角色的出现次数/涉及段落/置信度，confidence≥阈值（默认0.45）且
+        出现≥2次才建卡；已有同名卡不会覆盖，避免破坏手工卡。
+
+        Args:
+            source(string): recent=最近产出（默认）；library=素材库全部；work=当前作品全部章节；manual=手动传 text。
+            text(string): source=manual 时必填，要分析的原文。
+            scope(string): global=存全局；work=存当前作品（默认）。
+            work(string): 可选，scope=work 时指定作品。
+            min_confidence(string): 提卡最低置信度 0~1，默认 0.45。
+        """
+        sandbox = self._get_sandbox(event)
+        if not sandbox:
+            return "找不到沙盒（无法识别发送者）。"
+        active = sandbox.get_active_work() or ""
+        if work.strip():
+            active = sandbox.set_active_work(work.strip())
+        scope = scope.strip().lower()
+        if scope not in ("global", "work"):
+            scope = "work"
+        if scope == "work" and not active:
+            return "存作品卡需要先指定作品：scope=work 且给 work 参数，或先激活一个作品。"
+        try:
+            threshold = max(0.0, min(1.0, float(min_confidence)))
+        except Exception:
+            threshold = 0.45
+
+        source = source.strip().lower() or "recent"
+        if source == "manual":
+            if not text.strip():
+                return "source=manual 需要提供 text 参数（要分析的原文）。"
+            full_text = text.strip()
+        elif source == "library":
+            srcs = sandbox.library_sources() or sandbox.favorite_sources()
+            if not srcs:
+                return "素材库还是空的，先放些素材或收藏再说♪"
+            full_text = _pack_sources(srcs, limit=6000)
+        elif source == "work":
+            if not active:
+                return "分析作品章节需要先激活作品（work 参数或沙盒作品切换）。"
+            ch_parts: list[str] = []
+            for p in sorted(sandbox.chapters_dir(active).glob("*.txt")):
+                try:
+                    ch_parts.append(p.read_text(encoding="utf-8").strip())
+                except Exception:
+                    continue
+            full_text = "\n\n".join(ch_parts)[:6000]
+            if not full_text.strip():
+                return f"《{active}》的章节文件为空，先写点内容再说♪"
+        else:  # recent
+            full_text = self._last_assistant_output(sandbox, max_chars=6000)
+            if not full_text:
+                return "沙盒还没有产出，先写一段再说♪"
+
+        try:
+            chars = await self._extract_characters(full_text)
+        except Exception as e:
+            logger.error(f"沙盒提炼角色失败: {e}")
+            return "角色统计失败了，请再试一次。"
+
+        passed = [
+            c for c in chars
+            if c.get("confidence", 0) >= threshold and c.get("mention_count", 0) >= 2
+        ]
+        if not passed:
+            return "这一段里没有明显够格的角色（出现次数/置信度不足），换更长的正文再试试？"
+
+        reference = sandbox.render_story_memory(active)[:1500] if active else ""
+        created: list[str] = []
+        skipped: list[str] = []
+        suspect_cards: list[str] = []
+        for c in passed:
+            nm = str(c.get("name") or "").strip() or "未命名"
+            if sandbox.load_character(nm, active):
+                skipped.append(nm)
+                continue
+            role_hint = str(c.get("role_hint") or "配角")
+            traits = str(c.get("traits") or "").strip()
+            desc = f"{nm}，{role_hint}。{traits}" if traits else f"{nm}，{role_hint}。"
+            prompt = build_character_prompt(description=desc, reference=reference)
+            raw = await self._llm_chat(prompt, system_prompt="你只输出 JSON，不要输出任何其他文字。")
+            card = None
+            raw = self._clean(raw)
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    card = parsed
+            except Exception:
+                m = re.search(r"\{.*\}", raw, re.S)
+                if m:
+                    try:
+                        parsed = json.loads(m.group(0))
+                        if isinstance(parsed, dict):
+                            card = parsed
+                    except Exception:
+                        pass
+            if card is None:
+                skipped.append(f"{nm}(解析失败)")
+                continue
+            basic = card.get("basic") if isinstance(card.get("basic"), dict) else {}
+            basic["name"] = nm
+            card["basic"] = basic
+            sandbox.save_character(card, scope, active)
+            created.append(nm)
+            if active:
+                foreign = sandbox.check_card_foreign(card, active)
+                if foreign:
+                    suspect_cards.append(f"{nm}（{'、'.join(foreign)}）")
+
+        lines = ["【角色提炼完成♪】"]
+        lines.append("新建人设卡：" + ("、".join(created) if created else "（无）"))
+        if skipped:
+            lines.append("跳过（已有卡或失败）：" + "、".join(skipped))
+        if suspect_cards:
+            lines.append("⚠️ 以下新卡疑似夹带名单外人物关联（未出场/未提到）：" + "；".join(suspect_cards))
+        lines.append("卡库现有：" + ("、".join(sandbox.list_characters(active)) or "（空）"))
+        return "\n".join(lines)
+
+    # ═══════════════════════════════════════════
+    # 工具 5.9：沙盒废稿清理（旧文件清单 + 按编号删除）
+    # ═══════════════════════════════════════════
+    @filter.llm_tool(name="sandbox_cleanup")
+    async def sandbox_cleanup(
+        self,
+        event: AstrMessageEvent,
+        action: str = "list",
+        days: int = 30,
+        targets: str = "",
+    ) -> str:
+        """列出/清理沙盒里的旧废稿（短篇输出 + 作品章节）。
+
+        当用户说「看看有哪些旧稿」「清理一下旧文件」「把很久没动的稿子列出来」时调用。
+        先 action=list 列出超过 days 天未修改的文件（带编号），用户点名编号后
+        再 action=delete 删除（targets 传编号，如「1,3」）。
+
+        Args:
+            action(string): list=列出旧文件（默认）；delete=按编号删除。
+            days(int): 多少天以上算旧稿，默认 30。
+            targets(string): delete 时要删的编号，逗号分隔，如「1,3,5」。
+        """
+        sandbox = self._get_sandbox(event)
+        if not sandbox:
+            return "找不到沙盒（无法识别发送者）。"
+        if action == "delete":
+            if not targets.strip():
+                return "delete 需要先指定要删的编号（targets），例如 targets=\"1,3\"。"
+            stale = sandbox.list_stale_files(days=max(1, days))
+            nums = [n.strip() for n in re.split(r"[,，、\s]+", targets) if n.strip().isdigit()]
+            if not nums:
+                return "编号格式不对，像「1,3」这样传。"
+            deleted, missed = [], []
+            for n in nums:
+                i = int(n)
+                if 1 <= i <= len(stale):
+                    p = Path(stale[i - 1]["path"])
+                    try:
+                        if p.exists():
+                            p.unlink()
+                            deleted.append(stale[i - 1]["name"])
+                    except Exception as e:
+                        missed.append(f"{n}({e})")
+                else:
+                    missed.append(n)
+            body = f"已清理 {len(deleted)} 个旧稿：{'、'.join(deleted) if deleted else '（无）'}"
+            if missed:
+                body += f"\n没删掉的编号：{', '.join(missed)}（可能越界或删除失败）"
+            return body
+        # list
+        stale = sandbox.list_stale_files(days=max(1, days))
+        if not stale:
+            return f"超过 {days} 天没动过的旧稿：没有哦，沙盒很干净♪"
+        lines = [f"【沙盒旧稿清单】超过 {days} 天未修改（共 {len(stale)} 个）："]
+        for i, it in enumerate(stale, 1):
+            size_kb = it["size"] / 1024
+            lines.append(f"{i}. {it['name']}（{it['label']}｜{it['mtime']}｜{size_kb:.1f}KB）")
+        lines.append("要清理哪个就说编号，例如「清理 1、3」，人家确认后动手♪")
+        return "\n".join(lines)
 
     # ═══════════════════════════════════════════
     # 工具 6：沙盒重置
     # ═══════════════════════════════════════════
-    @filter.llm_tool(name="沙盒重置")
+    @filter.llm_tool(name="sandbox_reset")
     async def sandbox_reset(
         self,
         event: AstrMessageEvent,

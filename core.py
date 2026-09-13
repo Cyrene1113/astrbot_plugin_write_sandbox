@@ -7,9 +7,11 @@
 """
 from __future__ import annotations
 
+import difflib
 import json
 import re
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -69,7 +71,13 @@ CONSTRAINTS_FILE = "constraints.json"
 CHAPTER_SUMMARIES_FILE = "chapter_summaries.json"
 STORY_STATE_FILE = "story_state.json"
 OUTLINE_FILE = "outline.json"
+PENDING_OUTLINE_FILE = "outline.pending.json"
 ACTIVE_WORK_FILE = "active_work.json"
+STORY_CONFIG_FILE = "story_config.json"
+
+DEFAULT_STORY_CONFIG: dict[str, Any] = {
+    "chapter_link": "auto",  # auto 自动 / continuous 连续叙事 / break 断章收尾
+}
 
 DEFAULT_STORY_STATE: dict[str, Any] = {
     "meta": {"title": "", "current_chapter": 0},
@@ -169,6 +177,14 @@ class Sandbox:
                 json.dumps(self.style_card, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+
+    def save_style_card_to_library(self, name: str, card: dict) -> Path:
+        """把一张风格卡保存到 style_cards/ 库存，可被 sandbox_style_combo 点名。"""
+        safe = _safe_title(name, max_len=32) or "未命名风格"
+        path = self.style_cards_dir / f"{safe}.json"
+        with _LOCK:
+            path.write_text(json.dumps(card, ensure_ascii=False, indent=2), encoding="utf-8")
+        return path
 
     # ── 风格卡库与组合 ────────────────────────
     def list_style_cards(self) -> list[str]:
@@ -401,12 +417,65 @@ class Sandbox:
                 json.dumps(outline, ensure_ascii=False, indent=2), encoding="utf-8"
             )
 
+    # ── 大纲草稿（待确认）─────────────────────
+    def save_pending_outline(self, work: str, outline: dict[str, Any]) -> None:
+        """保存大纲草稿（待审核），不覆盖正式大纲。"""
+        with _LOCK:
+            (self.work_dir(work) / PENDING_OUTLINE_FILE).write_text(
+                json.dumps(outline, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+
+    def load_pending_outline(self, work: str) -> dict[str, Any] | None:
+        """加载大纲草稿；不存在或解析失败返回 None。"""
+        f = self.work_dir(work) / PENDING_OUTLINE_FILE
+        if not f.exists():
+            return None
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+        return None
+
+    def has_pending_outline(self, work: str) -> bool:
+        return self.load_pending_outline(work) is not None
+
+    def discard_pending_outline(self, work: str) -> None:
+        """丢弃大纲草稿。"""
+        f = self.work_dir(work) / PENDING_OUTLINE_FILE
+        try:
+            if f.exists():
+                f.unlink()
+        except Exception:
+            pass
+
+    def confirm_outline(self, work: str) -> bool:
+        """把草稿落盘为正式大纲；有草稿且成功返回 True。"""
+        pending = self.load_pending_outline(work)
+        if pending is None:
+            return False
+        self.save_outline(work, pending)
+        self.discard_pending_outline(work)
+        return True
+
     def render_outline(self, work: str) -> str:
         """完整渲染大纲（全局脉络 + 全部章节节点），用于查看/编辑。"""
-        outline = self.load_outline(work)
+        return self._render_outline_data(work, self.load_outline(work), prefix="")
+
+    def render_pending_outline(self, work: str) -> str:
+        """渲染大纲草稿（待审核）。"""
+        pending = self.load_pending_outline(work)
+        if pending is None:
+            return "（当前没有待确认的大纲草稿）"
+        return self._render_outline_data(work, pending, prefix="【待确认草稿】")
+
+    def _render_outline_data(self, work: str, outline: dict[str, Any], prefix: str = "") -> str:
         meta = outline.get("meta") if isinstance(outline.get("meta"), dict) else {}
         chapters = outline.get("chapters") or []
         lines = [f"【《{work}》大纲】"]
+        if prefix:
+            lines.append(prefix)
         if meta.get("premise"):
             lines.append(f"核心设定：{meta['premise']}")
         if meta.get("theme"):
@@ -493,10 +562,128 @@ class Sandbox:
         hook = cur.get("cliffhanger", "")
         if hook:
             lines.append(f"结尾钩子：{hook}")
+        moods = cur.get("mood") or []
+        if isinstance(moods, str):
+            moods = [moods]
+        moods = [str(m) for m in moods if str(m).strip()]
+        if moods:
+            lines.append("本章灵感便签：" + "；".join(moods))
         notes = cur.get("notes", "")
         if notes:
             lines.append(f"备注：{notes}")
         return "\n".join(lines)
+
+    # ── 章节接续配置（按作品开关）──────────────
+    def load_story_config(self, work: str) -> dict[str, Any]:
+        """加载作品小配置；不存在返回默认。"""
+        f = self.work_dir(work) / STORY_CONFIG_FILE
+        if not f.exists():
+            return dict(DEFAULT_STORY_CONFIG)
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                cfg = dict(DEFAULT_STORY_CONFIG)
+                cfg.update({k: v for k, v in data.items() if k in cfg})
+                return cfg
+        except Exception:
+            pass
+        return dict(DEFAULT_STORY_CONFIG)
+
+    def save_story_config(self, work: str, cfg: dict[str, Any]) -> None:
+        with _LOCK:
+            (self.work_dir(work) / STORY_CONFIG_FILE).write_text(
+                json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+
+    def get_chapter_link_mode(self, work: str) -> str:
+        return self.load_story_config(work).get("chapter_link", "auto")
+
+    def set_chapter_link_mode(self, work: str, mode: str) -> str:
+        mode = mode.strip().lower()
+        if mode not in ("auto", "continuous", "break"):
+            return "invalid"
+        cfg = self.load_story_config(work)
+        cfg["chapter_link"] = mode
+        self.save_story_config(work, cfg)
+        return mode
+
+    # ── 灵感便签（绑大纲章节节点）──────────────
+    def add_outline_mood(self, work: str, ch: int, text: str) -> bool:
+        """给大纲某章节点追加灵感便签；节点不存在返回 False。"""
+        outline = self.load_outline(work)
+        chapters = outline.get("chapters") or []
+        cur = next((it for it in chapters if isinstance(it, dict) and int(it.get("ch", 0)) == ch), None)
+        if cur is None:
+            return False
+        moods = cur.get("mood") or []
+        if isinstance(moods, str):
+            moods = [moods]
+        moods = [m for m in moods if str(m).strip()]
+        moods.append(text.strip())
+        cur["mood"] = moods
+        self.save_outline(work, outline)
+        return True
+
+    def clear_outline_mood(self, work: str, ch: int) -> bool:
+        """清空某章灵感便签；节点不存在返回 False。"""
+        outline = self.load_outline(work)
+        chapters = outline.get("chapters") or []
+        cur = next((it for it in chapters if isinstance(it, dict) and int(it.get("ch", 0)) == ch), None)
+        if cur is None:
+            return False
+        if "mood" in cur:
+            cur.pop("mood", None)
+            self.save_outline(work, outline)
+        return True
+
+    def render_chapter_mood(self, work: str, ch: int) -> str:
+        """取本章氛围引子：灵感便签 > 结尾钩子 > 基调，断章续写时用。"""
+        outline = self.load_outline(work)
+        chapters = outline.get("chapters") or []
+        cur = next((it for it in chapters if isinstance(it, dict) and int(it.get("ch", 0)) == ch), None)
+        if cur is None:
+            return ""
+        parts = []
+        moods = cur.get("mood") or []
+        if isinstance(moods, str):
+            moods = [moods]
+        moods = [str(m) for m in moods if str(m).strip()]
+        if moods:
+            parts.append("灵感便签：" + "；".join(moods))
+        hook = cur.get("cliffhanger", "")
+        if hook:
+            parts.append(f"结尾钩子：{hook}")
+        tone = cur.get("tone", "")
+        if tone:
+            parts.append(f"本章基调：{tone}")
+        return "\n".join(parts) if parts else ""
+
+    def chapter_exists(self, work: str, ch: int) -> bool:
+        """章节文件是否已存在（用于判断 continue 场景）。"""
+        d = self.chapters_dir(work)
+        if not d.exists():
+            return False
+        return bool(list(d.glob(f"ch{int(ch):02d}*.txt")))
+
+    def read_chapter_tail(self, work: str, ch: int, n_lines: int = 3, max_chars: int = 600) -> str:
+        """读取章节文件末尾几行，用于连续叙事续写。"""
+        d = self.chapters_dir(work)
+        if not d.exists():
+            return ""
+        files = sorted(d.glob(f"ch{int(ch):02d}*.txt"))
+        if not files:
+            return ""
+        try:
+            text = files[0].read_text(encoding="utf-8").strip()
+        except Exception:
+            return ""
+        if not text:
+            return ""
+        lines = text.splitlines()
+        tail = "\n".join(lines[-n_lines:])
+        if len(tail) > max_chars:
+            tail = tail[-max_chars:]
+        return tail
 
     # ── 人设卡（全局 / 作品 双存储）──────────────
     def work_characters_dir(self, work: str) -> Path:
@@ -626,6 +813,46 @@ class Sandbox:
         lines.append(f"（存储：{scope_label}）")
         return "\n".join(lines)
 
+    def render_global_card_pool(self, work: str, ch: int) -> str:
+        """全局卡池摘要：一行一张（名字｜身份｜核心特征），供选角判断。
+
+        排除本章已出场（已由 render_work_characters 注入）与已有作品卡的角色，
+        避免重复注入或作品卡被全局卡遮蔽。
+        """
+        outline = self.load_outline(work)
+        chapters = outline.get("chapters") or []
+        cur = next((it for it in chapters if isinstance(it, dict) and int(it.get("ch", 0)) == ch), None)
+        exclude: set[str] = set()
+        if cur and isinstance(cur.get("characters"), list):
+            exclude |= {str(c).strip() for c in cur["characters"] if str(c).strip()}
+        wd = self.work_dir(work) / CHARACTERS_DIR_NAME
+        for p in sorted(wd.glob("*.json")):
+            exclude.add(p.stem)
+        lines: list[str] = []
+        for p in sorted(self.characters_dir.glob("*.json")):
+            try:
+                card = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(card, dict):
+                continue
+            basic = card.get("basic") if isinstance(card.get("basic"), dict) else {}
+            name = str(basic.get("name") or p.stem).strip()
+            if not name or name in exclude:
+                continue
+            identity = str(basic.get("identity") or "").strip()
+            personality = str(basic.get("personality") or "").strip()
+            st = card.get("story") if isinstance(card.get("story"), dict) else {}
+            role = str(st.get("role") or "").strip()
+            feat = personality[:40] or identity[:40] or role
+            line = f"- {name}"
+            if identity:
+                line += f"｜{identity}"
+            if feat:
+                line += f"｜{feat}"
+            lines.append(line)
+        return "\n".join(lines) if lines else ""
+
     def render_work_characters(self, work: str, ch: int) -> str:
         """按大纲章节节点的「出场角色」加载人设卡（作品卡优先），拼成注入文本。"""
         outline = self.load_outline(work)
@@ -647,6 +874,237 @@ class Sandbox:
                 lines.append(self.render_character(card))
             else:
                 lines.append(f"（角色「{n}」还没有人设卡，可按上下文自由处理）")
+        return "\n".join(lines)
+
+    _NON_PERSON_TAIL = set("猫狗鸟鱼店馆楼屋山城镇村院厅房桥路树花月界泉谷川林峰崖湾洲原野漠岭岸河江湖海云霞霜雪风雨星日夜晨昏光影烟雾尘沙石岩玉珠花草树叶枝根藤果实籽瓣潮汐波浪溪涧瀑布潭泽")
+
+    # 关系句式里出现但不算「人名」的常见称谓/泛称（整卡扫描时排除）
+    _RELATION_COMMON_WORDS = set(
+        "家人朋友兄弟姊妹姐妹父母双亲母亲父亲妻子丈夫恋人情人敌人仇人同伴伙伴同事同学"
+        "邻居路人故人旧识恩人仇家师父徒弟师尊弟子老师学生兄长妹妹弟弟哥哥姐姐叔伯姑舅"
+        "亲戚长辈晚辈子女儿女乡亲邻里众人大家自己彼此对方谁某一切有些那些这些哪个哪位"
+        "熟人新人旧人前人后人外人内人本人亲人挚友密友战友同僚同乡同门同窗心腹亲信下属"
+        "上司老板掌柜伙计仆役丫鬟家丁护卫随从红颜蓝颜知己伯乐贵人对手劲敌宿敌情敌冤家"
+        "对头死对头陌生人旁人家中老小一家老小孤老孤儿寡妇遗孀弃子继母继父养母养父义父"
+        "义母干爹干娘结拜忘年交莫逆生死交患难交泛泛之交点头交一面之缘青梅竹马未婚妻未婚夫前任"
+        "他们她们我们你们咱们人家自己彼此对方众人各位诸位"
+    )
+
+    # 从整卡文本里抓「明确关系句式」中出现的人名候选（只抓带关系名词/关系动作的结构，降低误报）
+    _RELATION_PATTERNS = (
+        re.compile(r"(?:与|和|跟|同)([\u4e00-\u9fff]{2,3}?)(?:有|是|为|成)?(?:的)?(?:关系|恩怨|旧情|旧怨|约定|婚约|交情|情谊|羁绊|缘分|师徒|主仆|兄妹|兄弟|姐妹|母女|父子|仇怨|过节|瓜葛|牵连|牵扯|情债|旧识)"),
+        re.compile(r"(?:与|和|跟|同)([\u4e00-\u9fff]{2,3}?)(?:有|是|为|成)?(?:一起|重逢|相遇|相识|联手|结盟|结拜|决裂|反目|同居|共事|同行|结伴|成婚|成亲|对峙|交手|并肩)"),
+    )
+
+    @staticmethod
+    def _looks_like_person_name(rn: str) -> bool:
+        """判断一个关系对象名是否「像人名」：2~4字、无「的」字结构、不以常见物名词尾结尾。"""
+        if not (2 <= len(rn) <= 4):
+            return False
+        if "的" in rn:
+            return False
+        if rn[-1] in Sandbox._NON_PERSON_TAIL:
+            return False
+        return True
+
+    def _work_body_text(self, work: str, max_chars: int = 200000) -> str:
+        """拼接作品全部章节正文（截断上限），用于「正文是否出现过该角色」的判定。"""
+        parts: list[str] = []
+        total = 0
+        for p in sorted(self.chapters_dir(work).glob("*.txt")):
+            try:
+                t = p.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            if total + len(t) > max_chars:
+                parts.append(t[: max_chars - total])
+                break
+            parts.append(t)
+            total += len(t)
+        return "\n".join(parts)
+
+    @staticmethod
+    def _card_all_text(card: dict) -> str:
+        """把整张人设卡的所有字段文本拼起来，供整卡扫描。"""
+        parts: list[str] = []
+
+        def walk(v):
+            if isinstance(v, str):
+                parts.append(v)
+            elif isinstance(v, list):
+                for it in v:
+                    walk(it)
+            elif isinstance(v, dict):
+                for it in v.values():
+                    walk(it)
+
+        walk(card)
+        return "\n".join(parts)
+
+    def _card_foreign_names(self, card: dict, known: set[str], body_text: str) -> list[str]:
+        """从整张卡（所有字段）里提取「像人名但不在 known ∪ 正文」的对象名。
+
+        用于揪出临时人物卡里夹带的未出场/未提到人物关联。
+        """
+        if not isinstance(card, dict):
+            return []
+        candidates: set[str] = set()
+        bg = card.get("background") if isinstance(card.get("background"), dict) else {}
+        rels = bg.get("relations") or []
+        if isinstance(rels, list):
+            for r in rels:
+                if isinstance(r, dict):
+                    rn = str(r.get("name") or "").strip()
+                    if rn and not rn.startswith("（"):
+                        candidates.add(rn)
+        text = Sandbox._card_all_text(card)
+        for pat in Sandbox._RELATION_PATTERNS:
+            for m in pat.finditer(text):
+                nm = m.group(1).strip()
+                if nm:
+                    candidates.add(nm)
+        suspects: list[str] = []
+        for nm in sorted(candidates):
+            if nm.endswith("们"):
+                nm = nm[:-1]
+            if not nm or nm in Sandbox._RELATION_COMMON_WORDS:
+                continue
+            if nm in known or nm in body_text:
+                continue
+            if Sandbox._looks_like_person_name(nm):
+                suspects.append(nm)
+        return suspects
+
+    def check_card_foreign(self, card: dict, work: str) -> list[str]:
+        """单张卡即时自检：卡里提到的、不在大纲名单/卡名/正文里的人物名。"""
+        if not isinstance(card, dict) or not work:
+            return []
+        outline = self.load_outline(work)
+        meta = outline.get("meta") if isinstance(outline.get("meta"), dict) else {}
+        chapters = outline.get("chapters") or []
+        known: set[str] = set()
+        for c in meta.get("characters") or []:
+            if isinstance(c, dict) and c.get("name"):
+                known.add(str(c["name"]).strip())
+            elif isinstance(c, str) and c.strip():
+                known.add(c.strip())
+        for it in chapters:
+            if isinstance(it, dict) and isinstance(it.get("characters"), list):
+                for c in it["characters"]:
+                    if str(c).strip():
+                        known.add(str(c).strip())
+        known |= set(self.list_characters(work))
+        body_text = self._work_body_text(work)
+        return self._card_foreign_names(card, known, body_text)
+
+    def audit_characters(self, work: str) -> dict[str, Any]:
+        """复核当前作品的人设卡与大纲/正文的一致性。
+
+        返回结构化报告：
+        - stale: 有卡但大纲零出场**且正文零出现**的角色（旧卡残留候选）
+        - missing: 大纲出场但没建卡的角色（缺卡，写作时只能按上下文自由处理）
+        - foreign_relations: {卡名: [无关角色名]}，卡里 relations 引用了像人名但不在
+          大纲/正文/卡名名单里的对象（疑似混入旧大纲或别的作品的角色）
+        - chapter_chars: 大纲各章出场角色合集（用于对照）
+        - meta_chars: 大纲 meta.characters 里的角色名
+        """
+        outline = self.load_outline(work)
+        meta = outline.get("meta") if isinstance(outline.get("meta"), dict) else {}
+        chapters = outline.get("chapters") or []
+
+        meta_chars: set[str] = set()
+        for c in meta.get("characters") or []:
+            if isinstance(c, dict) and c.get("name"):
+                meta_chars.add(str(c["name"]).strip())
+            elif isinstance(c, str) and c.strip():
+                meta_chars.add(c.strip())
+
+        chapter_chars: set[str] = set()
+        for it in chapters:
+            if isinstance(it, dict) and isinstance(it.get("characters"), list):
+                for c in it["characters"]:
+                    if str(c).strip():
+                        chapter_chars.add(str(c).strip())
+
+        all_roles = meta_chars | chapter_chars
+        body_text = self._work_body_text(work)
+        card_names = self.list_characters(work)
+        stale: list[str] = []
+        for n in card_names:
+            if n not in all_roles and n not in body_text:
+                stale.append(n)
+
+        missing: list[str] = []
+        for n in sorted(all_roles):
+            if not self.load_character(n, work):
+                missing.append(n)
+
+        foreign_relations: dict[str, list[str]] = {}
+        known = all_roles | set(card_names)
+        for n in card_names:
+            card = self.load_character(n, work)
+            if not card:
+                continue
+            bg = card.get("background") if isinstance(card.get("background"), dict) else {}
+            rels = bg.get("relations") or []
+            if not isinstance(rels, list):
+                continue
+            suspects: list[str] = []
+            for r in rels:
+                if not isinstance(r, dict):
+                    continue
+                rn = str(r.get("name") or "").strip()
+                if rn.startswith("（"):
+                    continue
+                if rn and rn not in known and rn not in body_text:
+                    if Sandbox._looks_like_person_name(rn):
+                        suspects.append(rn)
+            if suspects:
+                foreign_relations[n] = suspects
+
+        foreign_mentions: dict[str, list[str]] = {}
+        for n in card_names:
+            card = self.load_character(n, work)
+            if not card:
+                continue
+            suspects = self._card_foreign_names(card, known, body_text)
+            if suspects:
+                foreign_mentions[n] = suspects
+
+        return {
+            "stale": stale,
+            "missing": missing,
+            "foreign_relations": foreign_relations,
+            "foreign_mentions": foreign_mentions,
+            "chapter_chars": sorted(chapter_chars),
+            "meta_chars": sorted(meta_chars),
+        }
+
+    def render_character_audit(self, work: str) -> str:
+        """把人物卡复核报告渲染成可读文本。"""
+        rep = self.audit_characters(work)
+        lines = [f"【《{work}》人物卡复核】"]
+        stale = rep["stale"]
+        missing = rep["missing"]
+        foreign = rep["foreign_relations"]
+        foreign_mentions = rep.get("foreign_mentions") or {}
+        if stale:
+            lines.append("⚠️ 疑似旧卡残留（有卡但大纲零出场）：")
+            lines.append("、".join(f"「{s}」" for s in stale))
+        if missing:
+            lines.append("📌 大纲有出场但没建卡：")
+            lines.append("、".join(f"「{m}」" for m in missing))
+        foreign_merged: dict[str, list[str]] = {}
+        for card in sorted(set(foreign) | set(foreign_mentions)):
+            merged = sorted(set(foreign.get(card, [])) | set(foreign_mentions.get(card, [])))
+            if merged:
+                foreign_merged[card] = merged
+        if foreign_merged:
+            lines.append("🔗 卡里引用了名单外的角色（疑似夹带未出场/未提到人物的关联）：")
+            for card, names in foreign_merged.items():
+                lines.append(f"  「{card}」→ {'、'.join(names)}")
+        if not stale and not missing and not foreign_merged:
+            lines.append("人设卡与大纲一致，没有发现旧卡残留、缺卡或无关信息♪")
         return "\n".join(lines)
 
     def next_chapter_no(self, work: str) -> int:
@@ -906,3 +1364,180 @@ class Sandbox:
         if extras:
             lines.append(f"- 单篇特色样本 ×{len(extras)}（按需调用）")
         return "\n".join(lines) if lines else "（风格卡为空）"
+
+    # ── 口水词小哨兵 / 旧稿清理 ────────────────
+    COMMON_FILLER_WORDS = (
+        "轻轻", "仿佛", "缓缓", "似乎", "笑了笑", "微微", "一点", "有些",
+        "像是", "终于", "慢慢", "眼神", "嘴角", "忍不住", "悄悄", "淡淡",
+        "深深", "忽然", "默默", "静静", "渐渐", "隐隐", "细细", "柔和",
+    )
+    _FILLER_STOP = frozenset(
+        "我们 他们 她们 这个 那个 一个 什么 没有 自己 知道 时候 已经 "
+        "因为 所以 但是 可是 然后 这样 那样 起来 出来 过来 觉得 看到 "
+        "听到 说道 只是 还是 就是 也是 不是 都是 现在 还是 一直 真的".split()
+    )
+
+    # 对白归一化时剥掉的装饰词/语气词（与旁白内置表分开，避免误伤语义）
+    _DIALOG_STRIP_WORDS = (
+        "轻轻", "仿佛", "缓缓", "似乎", "微微", "一点", "有些", "像是", "终于", "慢慢",
+        "眼神", "嘴角", "忍不住", "悄悄", "淡淡", "深深", "忽然", "默默", "静静",
+        "渐渐", "隐隐", "细细", "柔和", "叹了口气", "笑了笑", "愣了一下",
+    )
+    _DIALOG_TONES = "啊呀啦呢吧嘛哦唉嘿嗯唔哈噢哟诶"
+
+    def collect_whitelist(self, work: str = "") -> set[str]:
+        """收集全局卡 + 作品卡的人名/别名，作为哨兵白名单（永不参与检测/替换）。"""
+        names: set[str] = set()
+
+        def _add(raw: Any) -> None:
+            s = re.sub(r"[（(].*?[)）]", "", str(raw or "")).strip()
+            s = re.sub(r"[\s·・]+", "", s)
+            if len(s) >= 2:
+                names.add(s)
+
+        def _scan_dir(d: Path) -> None:
+            if not d.exists():
+                return
+            for p in d.glob("*.json"):
+                try:
+                    card = json.loads(p.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                basic = card.get("basic") if isinstance(card.get("basic"), dict) else {}
+                _add(p.stem)
+                _add(basic.get("name"))
+                aliases = basic.get("aliases") or []
+                if isinstance(aliases, str):
+                    aliases = [aliases]
+                for a in aliases:
+                    _add(a)
+
+        try:
+            _scan_dir(self.characters_dir)
+            if work:
+                _scan_dir(self.work_characters_dir(work))
+        except Exception:
+            pass
+        return names
+
+    @staticmethod
+    def _extract_dialogues(text: str) -> list[tuple[int, str]]:
+        """抽取引号内对白：返回 [(段落号, 对白文本)]。"""
+        out: list[tuple[int, str]] = []
+        for i, line in enumerate([p for p in text.splitlines() if p.strip()], 1):
+            for d in re.findall(r"[“\"]([^”\"]{2,})[”\"]", line):
+                out.append((i, d))
+        return out
+
+    def _norm_dialogue(self, s: str, whitelist: set[str]) -> str:
+        """对白归一化：人名打码 → 同义词统一 → 剥装饰词/语气词/标点。"""
+        s = str(s or "").strip()
+        for w in sorted(whitelist, key=len, reverse=True):
+            if w:
+                s = s.replace(w, "@N@")
+        s = re.sub(r"(说道|开口道|开口|说|道)", "@S@", s)
+        for f in self._DIALOG_STRIP_WORDS:
+            s = s.replace(f, "")
+        s = re.sub(f"[{self._DIALOG_TONES}]", "", s)
+        s = re.sub(r"[\s\W_]+", "", s)
+        return s
+
+    def detect_repeated_words(self, text: str, top_n: int = 5, work: str = "") -> str:
+        """口水词小哨兵 v2：对白看语义重复，旁白看高频次数，人名白名单保护。"""
+        if not text or not text.strip():
+            return ""
+        paras = [p.strip() for p in text.splitlines() if p.strip()]
+        full = "\n".join(paras)
+        whitelist = self.collect_whitelist(work)
+
+        # ① 对白：语义重复
+        dialogues = self._extract_dialogues(text)
+        dup_lines: list[str] = []
+        seen: set[tuple[str, str]] = set()
+        norms = [self._norm_dialogue(d, whitelist) for _, d in dialogues]
+        for a in range(len(dialogues)):
+            for b in range(a + 1, len(dialogues)):
+                ia, ra = dialogues[a]
+                ib, rb = dialogues[b]
+                if ia == ib:
+                    continue
+                na, nb = norms[a], norms[b]
+                if len(na) < 2 or len(nb) < 2:
+                    continue
+                ratio = difflib.SequenceMatcher(None, na, nb).ratio()
+                if ratio >= 0.88:
+                    key = tuple(sorted([f"{ia}:{ra}", f"{ib}:{rb}"]))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    dup_lines.append(
+                        f"· 第{ia}段「{ra}」≈ 第{ib}段「{rb}」（{round(ratio, 2)}）"
+                    )
+
+        # ② 旁白：高频词（排除对白、白名单、停用词）
+        narr = full
+        for _, d in dialogues:
+            narr = narr.replace(d, " ")
+        narr = re.sub(r"[“”\"\s]+", "", narr)
+        counts: dict[str, int] = {}
+        positions: dict[str, list[int]] = {}
+        for w in self.COMMON_FILLER_WORDS:
+            if w in narr:
+                cnt = narr.count(w)
+                if cnt >= 3:
+                    counts[w] = cnt
+        auto: dict[str, int] = {}
+        for m in re.findall(r"[\u4e00-\u9fff]{2,4}", narr):
+            auto[m] = auto.get(m, 0) + 1
+        for w, cnt in auto.items():
+            if cnt >= 5 and w not in counts and w not in self._FILLER_STOP:
+                counts[w] = cnt
+        for w in list(counts.keys()):
+            if w in whitelist or any(n in w or w in n for n in whitelist):
+                del counts[w]
+                continue
+            positions[w] = [i + 1 for i, p in enumerate(paras) if w in p]
+
+        if not dup_lines and not counts:
+            return ""
+        lines: list[str] = ["【口水词小哨兵】整章检查（对白看语义 / 旁白看频次）："]
+        if dup_lines:
+            lines.append(f"· 对白语义重复 {len(dup_lines)} 处：")
+            lines.extend(dup_lines[:top_n])
+        if counts:
+            lines.append("· 旁白高频词：")
+            ranked = sorted(counts.items(), key=lambda kv: -kv[1])[:top_n]
+            for w, cnt in ranked:
+                pos = "、".join(str(p) for p in positions[w][:5])
+                lines.append(f"  「{w}」×{cnt}（第 {pos} 段）")
+        return "\n".join(lines)
+
+    def list_stale_files(self, days: int = 30) -> list[dict[str, Any]]:
+        """列出 outputs/ 和各作品 chapters/ 下超过 days 天未修改的旧文件。"""
+        cutoff = time.time() - max(1, days) * 86400
+        results: list[dict[str, Any]] = []
+
+        def _scan(root: Path, label: str) -> None:
+            if not root.exists():
+                return
+            for p in root.rglob("*.txt"):
+                try:
+                    st = p.stat()
+                    if st.st_mtime < cutoff:
+                        results.append({
+                            "path": str(p),
+                            "name": p.name,
+                            "mtime": datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M"),
+                            "size": st.st_size,
+                            "label": label,
+                        })
+                except Exception:
+                    continue
+
+        _scan(self.outputs_dir, "短篇输出")
+        if self.stories_dir.exists():
+            for wd in self.stories_dir.iterdir():
+                if wd.is_dir():
+                    _scan(wd / CHAPTERS_DIR_NAME, f"作品《{wd.name}》章节")
+        results.sort(key=lambda r: r["mtime"], reverse=True)
+        return results

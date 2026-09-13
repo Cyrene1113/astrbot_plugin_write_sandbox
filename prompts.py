@@ -33,7 +33,7 @@ SYSTEM_PROMPT_TEMPLATE = """你是一个独立的文字创作引擎，正在一�
 【历史片段】
 {history}
 
-【长文记忆】（仅当前作品的摘要与设定书，禁止引入其他作品内容）
+【长文记忆】（仅当前作品的摘要、设定书，以及经选角判断注入的全局人设卡；禁止引入其他作品内容）
 {story_context}
 
 现在，用户的指令是：
@@ -214,6 +214,36 @@ def build_outline_prompt(instruction: str, reference: str = "") -> str:
     )
 
 
+
+# 长文：大纲微调（基于现有大纲局部修订，不推倒重来）
+OUTLINE_REVISE_PROMPT = """你是剧情架构师。任务：根据用户的调整要求，在「现有大纲」基础上做**局部修订**，输出修订后的大纲 JSON。
+
+【与全新生成的区别】
+- 只修改用户点名要求的部分；未被要求改动的 meta 字段与章节节点必须**原样保留**。
+- 章节总数原则上不变；用户明确要求增删章节时才增删，且要保证 chapters 编号连续（ch 从 1 起递增）。
+- 人物增删只发生在用户点名时：新增角色要写清定位与弧线；删除角色要同时把它从相关章节的 characters 出场名单里移除，并检查其他角色 relations 里不再引用它。
+- 结构固定，与现有大纲一致：meta(title/premise/theme/tone/arcs/characters/scale_map) + chapters(ch/title/summary/plot_points/characters/tone/scale/cliffhanger/notes)。
+- 只输出修订后的完整大纲 JSON，不要输出任何其他文字，也不要输出 diff 或说明。
+
+【现有大纲】
+{current_outline}
+
+【参考信息】（已有作品的摘要与设定书，用于对齐已写内容；可为空）
+{reference}
+
+【用户调整要求】
+{instruction}
+"""
+
+
+def build_outline_revise_prompt(instruction: str, current_outline: str, reference: str = "") -> str:
+    return (
+        OUTLINE_REVISE_PROMPT
+        .replace("{current_outline}", current_outline or "（无现有大纲）")
+        .replace("{reference}", reference or "（无）")
+        .replace("{instruction}", instruction)
+    )
+
 # 长文：人设卡（统一格式，全局/作品双存储）
 CHARACTER_PROMPT = """你是人设设计师。任务：根据用户的一句话描述，生成一张结构化「人设卡 JSON」。
 
@@ -251,9 +281,14 @@ CHARACTER_PROMPT = """你是人设设计师。任务：根据用户的一句话�
 【要求】
 - 所有条目都要填实，不要留空；用户没提到的地方按身份合理补全。
 - personality 必须含缺点，不要只写优点。
-- relations 里的名字尽量具体，不要用「朋友A」这种占位。
 - scale_role 贴合作品尺度，不确定时写「中」。
 - 只输出 JSON，不要输出任何其他文字。
+
+【信息边界铁律】（违反即废卡）
+- 全卡只允许使用【用户描述】与【参考信息】里明确出现的信息，禁止编造。
+- relations 只允许引用这两处明确出现过的角色名；没有可写对象时 relations 留空数组，绝不为了「具体」虚构人名。
+- 用户描述/参考信息里没有的人物、组织、地名、往事，一律不得写进任何字段（含 origin、secrets、plot_hooks、motivation）。
+- 拿不准的关联写「（关系待定，正文未提及）」或直接留空，禁止脑补「与XX有旧」「曾受XX之恩」这类故事里没影子的关联。
 
 【用户描述】
 {description}
@@ -268,4 +303,73 @@ def build_character_prompt(description: str, reference: str = "") -> str:
         CHARACTER_PROMPT
         .replace("{description}", description)
         .replace("{reference}", reference or "（无）")
+    )
+
+
+# 角色自动提炼：从正文统计角色出现频次、涉及段落与置信度，供自动建卡判断。
+CHARACTER_EXTRACT_PROMPT = """你是角色分析师。任务：从下面这段文字中统计所有「有戏份的角色」，输出 JSON。
+
+【统计规则】
+- 只统计真实参与剧情、有名字或稳定称呼的角色；路人（服务员/路人甲等一次性出现、无任何描写与台词）不要列入。
+- 每个角色记录：出现次数（mention_count，按姓名/稳定称呼出现次数粗算）、涉及段落数（sections_involved，按连续文本分段估计含该角色的段数）、置信度（confidence 0~1：是否值得建立人设卡，综合戏份权重、描写丰富度、对剧情的重要性）。
+- 从原文能看出的说话腔调、口头禅、外貌、性格、身份等，简要摘录到 traits。
+
+【输出 JSON 结构，只输出 JSON】
+{
+  "characters": [
+    {
+      "name": "角色名",
+      "aliases": ["原文中的其他称呼"],
+      "mention_count": 出现次数,
+      "sections_involved": 涉及段落数,
+      "confidence": 0~1,
+      "role_hint": "定位（主角/重要配角/配角）",
+      "traits": "从原文提炼的性格/外貌/身份要点（一两句）"
+    }
+  ]
+}
+
+【判定线】
+- confidence < 0.45 或 mention_count < 2 的角色：不要列入。
+- 宁可少而精，不要凑数。
+
+【信息边界铁律】
+- name、aliases、traits、role_hint 只允许摘录【正文】里明确出现的信息。
+- 禁止添加正文未出现的角色关联或背景关系（如「与XX是旧识」「曾受XX之恩」），原文没写的关联一律不写。
+- aliases 只收正文出现过的称呼；正文没出现的人名不得作为别名或 traits 出现。
+
+【正文】
+{text}
+"""
+
+
+def build_character_extract_prompt(text: str) -> str:
+    return CHARACTER_EXTRACT_PROMPT.replace("{text}", text)
+
+
+# 全局卡智能选角：从全局人设卡池里挑本章真正需要的卡（宁缺毋滥）
+GLOBAL_CARD_SELECT_PROMPT = """你是剧情选角师。任务：从「可选用全局人设卡池」中，选出本章写作真正需要的角色卡。
+
+【本章信息】
+{chapter_info}
+
+【可选用全局人设卡池】（每张一行：名字｜身份｜核心特征）
+{pool}
+
+【规则】
+- 默认一张都不选；只有当角色会在本章真实出场、被明确提及或直接影响本章剧情时，才选择它。
+- 已在【本章信息】出场名单里的角色不要重复选（它们已有人设卡注入）。
+- 宁缺毋滥：可有可无、拿不准的一律不选；不要为了让卡池里的卡露面而硬塞。
+- 最多选 3 张；选中的卡会以完整人设注入写作上下文，未选中的完全不会出现。
+
+【输出 JSON，只输出 JSON】
+{"selected": ["角色名1", "角色名2"]}
+"""
+
+
+def build_global_card_select_prompt(chapter_info: str, pool: str) -> str:
+    return (
+        GLOBAL_CARD_SELECT_PROMPT
+        .replace("{chapter_info}", chapter_info or "（无）")
+        .replace("{pool}", pool or "（无）")
     )

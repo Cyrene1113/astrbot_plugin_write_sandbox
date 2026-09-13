@@ -18,3 +18,6 @@ constraints.json
 .vscode/
 .DS_Store
 Thumbs.db
+
+# 本地代码索引缓存（codegraph 生成，不入库）
+.codegraph/
