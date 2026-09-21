@@ -47,6 +47,7 @@ LIBRARY_DIR_NAME = "library"
 FAVORITES_DIR_NAME = "favorites"
 STORIES_DIR_NAME = "stories"
 CHAPTERS_DIR_NAME = "chapters"
+DRAFTS_DIR_NAME = "drafts"
 CHARACTERS_DIR_NAME = "characters"
 CHARACTER_SCHEMA_VERSION = "1.0"
 HISTORY_FILE = "sandbox_history.jsonl"
@@ -701,6 +702,12 @@ class Sandbox:
                     names.append(p.stem)
         return names
 
+    def list_work_characters(self, work: str) -> list[str]:
+        """只列该作品目录下的人设卡（隔离机制：作品检索/审计只认作品卡，全局卡不参与）。"""
+        if not work:
+            return []
+        return sorted(p.stem for p in self.work_characters_dir(work).glob("*.json"))
+
     def _char_file(self, name: str, scope: str, work: str = "") -> Path:
         safe = f"{_safe_title(name, max_len=32)}.json"
         if scope == "work":
@@ -709,8 +716,8 @@ class Sandbox:
             return self.work_characters_dir(work) / safe
         return self.characters_dir / safe
 
-    def load_character(self, name: str, work: str = "") -> Optional[dict]:
-        """加载人设卡：作品卡优先，回退全局卡。"""
+    def load_character(self, name: str, work: str = "", work_only: bool = False) -> Optional[dict]:
+        """加载人设卡：作品卡优先，回退全局卡；work_only=True 时只加载作品卡（隔离机制）。"""
         name = name.strip()
         if not name:
             return None
@@ -724,6 +731,8 @@ class Sandbox:
                         return data
                 except Exception:
                     pass
+        if work_only:
+            return None
         gf = self.characters_dir / safe
         if gf.exists():
             try:
@@ -758,6 +767,94 @@ class Sandbox:
             path.unlink()
             return True
         return False
+
+    # ── 人设卡 update：纯代码字段合并（不进模型、不读设定书）──────────────
+    _CARD_FIELD_LABELS: dict[str, tuple[str, str]] = {
+        "称呼方式": ("speech", "address_style"),
+        "说话腔调": ("speech", "tone"),
+        "腔调": ("speech", "tone"),
+        "口头禅": ("speech", "catchphrases"),
+        "别名": ("basic", "aliases"),
+        "性别": ("basic", "gender"),
+        "年龄": ("basic", "age"),
+        "身份": ("basic", "identity"),
+        "外貌": ("basic", "appearance"),
+        "性格": ("basic", "personality"),
+        "习惯小动作": ("basic", "quirks"),
+        "小动作": ("basic", "quirks"),
+        "出身来历": ("background", "origin"),
+        "出身": ("background", "origin"),
+        "核心动机": ("background", "motivation"),
+        "动机": ("background", "motivation"),
+        "秘密": ("background", "secrets"),
+        "软肋": ("background", "secrets"),
+        "关系": ("background", "relations"),
+        "定位": ("story", "role"),
+        "人物弧线": ("story", "arc"),
+        "剧情钩子": ("story", "plot_hooks"),
+        "涩涩参与度": ("story", "scale_role"),
+        "尺度": ("story", "scale_role"),
+    }
+
+    def _match_card_label(self, text: str) -> Optional[tuple[str, str]]:
+        for label in sorted(self._CARD_FIELD_LABELS, key=len, reverse=True):
+            if label in text:
+                return self._CARD_FIELD_LABELS[label]
+        return None
+
+    def apply_character_edit(self, card: dict, description: str) -> tuple[bool, dict, list[str]]:
+        """纯代码字段合并：按描述中的明确指令对旧卡做增删改，其余字段原样保留。
+
+        支持写法：
+        - 「删除X」「删掉X」「去掉X」→ 删除该字段
+        - 「X改为Y」「把X改成Y」「X=Y」「X：Y」→ 设置该字段
+        - 含「保留/不动/其余」的句子直接跳过
+        列表类字段按 、，,/ 切分为数组。返回 (ok, 新卡, 变更说明)。
+        """
+        import copy as _copy
+        card = _copy.deepcopy(card)
+        changes: list[str] = []
+        sentences = [s for s in re.split(r"[；;\n]", description) if s.strip()]
+        for sent in sentences:
+            s = sent.strip()
+            m = re.match(r"^(删除|删掉|删去|去掉|移除|清掉)\s*(.*)$", s)
+            if m:
+                label = self._match_card_label(m.group(2).strip())
+                if label:
+                    sec, key = label
+                    sub = card.get(sec)
+                    if isinstance(sub, dict) and key in sub:
+                        del sub[key]
+                        changes.append(f"删除「{key}」")
+                    continue
+                changes.append(f"未识别字段，跳过：「{s}」")
+                continue
+            m = re.match(r"^(?:([^\s＝:=，,]+?)\s*(?:改为|改成|设为|设置为|设定为)\s*[＝:=：]?\s*(.*)$|([^\s＝:=，,]+?)\s*[＝:=：]\s*(.*)$)", s)
+            if m:
+                g1, g2, g3, g4 = m.groups()
+                field = (g1 or g3 or "").strip()
+                raw = (g2 or g4 or "").strip().strip("＝:=：")
+                label = self._match_card_label(field)
+                if label:
+                    sec, key = label
+                    sub = card.setdefault(sec, {})
+                    if key == "relations":
+                        sub[key] = []
+                        changes.append(f"清空「{key}」（关系结构复杂，请用 view 核对后手工调整）")
+                    elif key in ("aliases", "personality", "quirks", "secrets", "plot_hooks", "catchphrases"):
+                        vals = [v.strip() for v in re.split(r"[、,，/]", raw) if v.strip()]
+                        sub[key] = vals
+                        changes.append(f"设置「{key}」={vals}")
+                    else:
+                        sub[key] = raw
+                        changes.append(f"设置「{key}」={raw}")
+                    continue
+            if re.search(r"(保留|不动|维持|其余|其他)", s):
+                continue
+            changes.append(f"未识别指令，跳过：「{s}」")
+        if not changes:
+            return False, card, ["没有识别到任何可执行的字段指令，请用「删除X」「把X改为Y」的写法。"]
+        return True, card, changes
 
     def render_character(self, card: dict) -> str:
         """渲染一张人设卡为文本。"""
@@ -814,10 +911,11 @@ class Sandbox:
         return "\n".join(lines)
 
     def render_global_card_pool(self, work: str, ch: int) -> str:
-        """全局卡池摘要：一行一张（名字｜身份｜核心特征），供选角判断。
+        """作品卡池摘要：一行一张（名字｜身份｜核心特征），供选角判断。
 
-        排除本章已出场（已由 render_work_characters 注入）与已有作品卡的角色，
-        避免重复注入或作品卡被全局卡遮蔽。
+        隔离机制：作品写作只用本作品目录下的卡，全局卡不参与作品检索；
+        需要全局角色时，先把全局卡复制修改成作品卡再使用。
+        排除本章已出场（已由 render_work_characters 注入）的角色。
         """
         outline = self.load_outline(work)
         chapters = outline.get("chapters") or []
@@ -825,11 +923,8 @@ class Sandbox:
         exclude: set[str] = set()
         if cur and isinstance(cur.get("characters"), list):
             exclude |= {str(c).strip() for c in cur["characters"] if str(c).strip()}
-        wd = self.work_dir(work) / CHARACTERS_DIR_NAME
-        for p in sorted(wd.glob("*.json")):
-            exclude.add(p.stem)
         lines: list[str] = []
-        for p in sorted(self.characters_dir.glob("*.json")):
+        for p in sorted(self.work_characters_dir(work).glob("*.json")):
             try:
                 card = json.loads(p.read_text(encoding="utf-8"))
             except Exception:
@@ -869,7 +964,7 @@ class Sandbox:
             return ""
         lines = [f"【本章出场角色人设卡（《{work}》第{ch}章）】"]
         for n in names:
-            card = self.load_character(n, work)
+            card = self.load_character(n, work, work_only=True)
             if card:
                 lines.append(self.render_character(card))
             else:
@@ -993,7 +1088,7 @@ class Sandbox:
                 for c in it["characters"]:
                     if str(c).strip():
                         known.add(str(c).strip())
-        known |= set(self.list_characters(work))
+        known |= set(self.list_work_characters(work))
         body_text = self._work_body_text(work)
         return self._card_foreign_names(card, known, body_text)
 
@@ -1001,8 +1096,7 @@ class Sandbox:
         """复核当前作品的人设卡与大纲/正文的一致性。
 
         返回结构化报告：
-        - stale: 有卡但大纲零出场**且正文零出现**的角色（旧卡残留候选）
-        - missing: 大纲出场但没建卡的角色（缺卡，写作时只能按上下文自由处理）
+        - stale: 有卡但大纲零出场**且正文零出现**的角色（无关卡混入候选）
         - foreign_relations: {卡名: [无关角色名]}，卡里 relations 引用了像人名但不在
           大纲/正文/卡名名单里的对象（疑似混入旧大纲或别的作品的角色）
         - chapter_chars: 大纲各章出场角色合集（用于对照）
@@ -1028,16 +1122,11 @@ class Sandbox:
 
         all_roles = meta_chars | chapter_chars
         body_text = self._work_body_text(work)
-        card_names = self.list_characters(work)
+        card_names = self.list_work_characters(work)
         stale: list[str] = []
         for n in card_names:
             if n not in all_roles and n not in body_text:
                 stale.append(n)
-
-        missing: list[str] = []
-        for n in sorted(all_roles):
-            if not self.load_character(n, work):
-                missing.append(n)
 
         foreign_relations: dict[str, list[str]] = {}
         known = all_roles | set(card_names)
@@ -1073,7 +1162,6 @@ class Sandbox:
 
         return {
             "stale": stale,
-            "missing": missing,
             "foreign_relations": foreign_relations,
             "foreign_mentions": foreign_mentions,
             "chapter_chars": sorted(chapter_chars),
@@ -1085,15 +1173,11 @@ class Sandbox:
         rep = self.audit_characters(work)
         lines = [f"【《{work}》人物卡复核】"]
         stale = rep["stale"]
-        missing = rep["missing"]
         foreign = rep["foreign_relations"]
         foreign_mentions = rep.get("foreign_mentions") or {}
         if stale:
-            lines.append("⚠️ 疑似旧卡残留（有卡但大纲零出场）：")
+            lines.append("⚠️ 疑似无关卡（有卡但大纲与正文零出现）：")
             lines.append("、".join(f"「{s}」" for s in stale))
-        if missing:
-            lines.append("📌 大纲有出场但没建卡：")
-            lines.append("、".join(f"「{m}」" for m in missing))
         foreign_merged: dict[str, list[str]] = {}
         for card in sorted(set(foreign) | set(foreign_mentions)):
             merged = sorted(set(foreign.get(card, [])) | set(foreign_mentions.get(card, [])))
@@ -1103,21 +1187,31 @@ class Sandbox:
             lines.append("🔗 卡里引用了名单外的角色（疑似夹带未出场/未提到人物的关联）：")
             for card, names in foreign_merged.items():
                 lines.append(f"  「{card}」→ {'、'.join(names)}")
-        if not stale and not missing and not foreign_merged:
-            lines.append("人设卡与大纲一致，没有发现旧卡残留、缺卡或无关信息♪")
+        if not stale and not foreign_merged:
+            lines.append("人设卡与大纲一致，没有发现无关卡混入♪")
         return "\n".join(lines)
 
+    def _max_chapter_no(self, work: str) -> int:
+        """正式章节文件与摘要并集的当前最大章号；两边都空返回 0。"""
+        mx = 0
+        d = self.chapters_dir(work)
+        if d.exists():
+            for p in d.glob("ch*.txt"):
+                m = re.match(r"ch(\d+)", p.name)
+                if m:
+                    mx = max(mx, int(m.group(1)))
+        for it in self.load_chapter_summaries(work):
+            try:
+                mx = max(mx, int(it.get("ch", 0)))
+            except Exception:
+                continue
+        return mx
+
     def next_chapter_no(self, work: str) -> int:
-        items = self.load_chapter_summaries(work)
-        if items:
-            return max(int(it.get("ch", 0)) for it in items) + 1
-        return 1
+        return self._max_chapter_no(work) + 1
 
     def latest_chapter_no(self, work: str) -> int:
-        items = self.load_chapter_summaries(work)
-        if items:
-            return max(int(it.get("ch", 0)) for it in items)
-        return 0
+        return self._max_chapter_no(work)
 
     def save_chapter(self, work: str, ch: int, text: str, tag: str = "") -> Path:
         title = _safe_title(tag, max_len=20)
@@ -1135,6 +1229,77 @@ class Sandbox:
             existing = path.read_text(encoding="utf-8") if path.exists() else ""
             merged = (existing.rstrip() + "\n\n" + text) if existing.strip() else text
             path.write_text(merged, encoding="utf-8")
+        return path
+
+    # ── 章节草稿（独立暂存区）──────────────────
+    def drafts_dir(self, work: str) -> Path:
+        """作品草稿独立分区：写作期间先落这里，不占正式章节号。"""
+        d = self.work_dir(work) / DRAFTS_DIR_NAME
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def append_draft(self, work: str, draft_id: str, text: str, tag: str = "") -> Path:
+        """追加到作品草稿暂存文件（drafts/ 下，按 draft_id 区分），逐节落盘用。"""
+        title = _safe_title(tag, max_len=20)
+        filename = f"{draft_id}_{title}.txt" if title else f"{draft_id}.txt"
+        path = self.drafts_dir(work) / filename
+        with _LOCK:
+            existing = path.read_text(encoding="utf-8") if path.exists() else ""
+            merged = (existing.rstrip() + "\n\n" + text) if existing.strip() else text
+            path.write_text(merged, encoding="utf-8")
+        return path
+
+    def read_draft(self, work: str, draft_id: str) -> str:
+        """读取草稿全文；草稿不存在返回空串。"""
+        d = self.drafts_dir(work)
+        files = sorted(d.glob(f"{draft_id}_*.txt")) + sorted(d.glob(f"{draft_id}.txt"))
+        if not files:
+            return ""
+        try:
+            return files[0].read_text(encoding="utf-8")
+        except Exception:
+            return ""
+
+    def delete_draft(self, work: str, draft_id: str) -> None:
+        """删除草稿暂存文件。"""
+        d = self.drafts_dir(work)
+        for p in list(d.glob(f"{draft_id}_*.txt")) + list(d.glob(f"{draft_id}.txt")):
+            try:
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
+
+    def finalize_chapter(self, work: str, draft_id: str, ch: int, tag: str = "",
+                         append_mode: bool = False) -> Optional[Path]:
+        """写作全部完成后：读取草稿全文 → 按目标章号命名写入正式章节目录 → 删草稿。
+
+        rewrite 场景：目标 ch 已存在则整体覆盖该章（清掉旧文件），不新增章节号。
+        continue 场景（append_mode=True）：目标 ch 已存在则把草稿追加到旧文末尾，保留旧内容。
+        """
+        text = self.read_draft(work, draft_id)
+        if not text.strip():
+            return None
+        title = _safe_title(tag, max_len=20)
+        filename = f"ch{ch:02d}_{title}.txt" if title else f"ch{ch:02d}.txt"
+        d = self.chapters_dir(work)
+        path = d / filename
+        with _LOCK:
+            if append_mode and path.exists():
+                # 续写：保留旧内容，草稿追加到末尾
+                old = path.read_text(encoding="utf-8").rstrip()
+                merged = (old + "\n\n" + text) if old else text
+                path.write_text(merged.rstrip() + "\n", encoding="utf-8")
+            else:
+                # 覆盖该章所有旧版本文件，保证同章唯一
+                for p in list(d.glob(f"ch{ch:02d}_*.txt")) + list(d.glob(f"ch{ch:02d}.txt")):
+                    try:
+                        if p.exists():
+                            p.unlink()
+                    except Exception:
+                        pass
+                path.write_text(text.rstrip() + "\n", encoding="utf-8")
+        self.delete_draft(work, draft_id)
         return path
 
     def render_story_memory(self, work: str, summary_limit: int = 300) -> str:
@@ -1442,17 +1607,17 @@ class Sandbox:
         s = re.sub(r"[\s\W_]+", "", s)
         return s
 
-    def detect_repeated_words(self, text: str, top_n: int = 5, work: str = "") -> str:
-        """口水词小哨兵 v2：对白看语义重复，旁白看高频次数，人名白名单保护。"""
+    def analyze_repeated(self, text: str, work: str = "") -> dict:
+        """口水词小哨兵 v2 结构化版：返回 {dup: [...], freq: [...]}，供报告与自动修订复用。"""
         if not text or not text.strip():
-            return ""
+            return {"dup": [], "freq": []}
         paras = [p.strip() for p in text.splitlines() if p.strip()]
         full = "\n".join(paras)
         whitelist = self.collect_whitelist(work)
 
         # ① 对白：语义重复
         dialogues = self._extract_dialogues(text)
-        dup_lines: list[str] = []
+        dup: list[dict] = []
         seen: set[tuple[str, str]] = set()
         norms = [self._norm_dialogue(d, whitelist) for _, d in dialogues]
         for a in range(len(dialogues)):
@@ -1470,9 +1635,10 @@ class Sandbox:
                     if key in seen:
                         continue
                     seen.add(key)
-                    dup_lines.append(
-                        f"· 第{ia}段「{ra}」≈ 第{ib}段「{rb}」（{round(ratio, 2)}）"
-                    )
+                    dup.append({
+                        "a_no": ia, "a": ra, "b_no": ib, "b": rb,
+                        "ratio": round(ratio, 2),
+                    })
 
         # ② 旁白：高频词（排除对白、白名单、停用词）
         narr = full
@@ -1480,7 +1646,6 @@ class Sandbox:
             narr = narr.replace(d, " ")
         narr = re.sub(r"[“”\"\s]+", "", narr)
         counts: dict[str, int] = {}
-        positions: dict[str, list[int]] = {}
         for w in self.COMMON_FILLER_WORDS:
             if w in narr:
                 cnt = narr.count(w)
@@ -1492,12 +1657,24 @@ class Sandbox:
         for w, cnt in auto.items():
             if cnt >= 5 and w not in counts and w not in self._FILLER_STOP:
                 counts[w] = cnt
+        freq: list[dict] = []
         for w in list(counts.keys()):
             if w in whitelist or any(n in w or w in n for n in whitelist):
-                del counts[w]
                 continue
-            positions[w] = [i + 1 for i, p in enumerate(paras) if w in p]
+            paras_no = [i + 1 for i, p in enumerate(paras) if w in p]
+            freq.append({"word": w, "count": counts[w], "paras": paras_no})
+        freq.sort(key=lambda kv: -kv["count"])
+        return {"dup": dup, "freq": freq}
 
+    def detect_repeated_words(self, text: str, top_n: int = 5, work: str = "") -> str:
+        """口水词小哨兵 v2：对白看语义重复，旁白看高频次数，人名白名单保护。"""
+        res = self.analyze_repeated(text, work)
+        dup_lines = [
+            f"· 第{d['a_no']}段「{d['a']}」≈ 第{d['b_no']}段「{d['b']}」（{d['ratio']}）"
+            for d in res["dup"]
+        ]
+        counts = {f["word"]: f["count"] for f in res["freq"]}
+        positions = {f["word"]: f["paras"] for f in res["freq"]}
         if not dup_lines and not counts:
             return ""
         lines: list[str] = ["【口水词小哨兵】整章检查（对白看语义 / 旁白看频次）："]
@@ -1506,8 +1683,7 @@ class Sandbox:
             lines.extend(dup_lines[:top_n])
         if counts:
             lines.append("· 旁白高频词：")
-            ranked = sorted(counts.items(), key=lambda kv: -kv[1])[:top_n]
-            for w, cnt in ranked:
+            for w, cnt in sorted(counts.items(), key=lambda kv: -kv[1])[:top_n]:
                 pos = "、".join(str(p) for p in positions[w][:5])
                 lines.append(f"  「{w}」×{cnt}（第 {pos} 段）")
         return "\n".join(lines)

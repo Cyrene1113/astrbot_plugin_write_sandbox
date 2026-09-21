@@ -95,8 +95,8 @@ class WriteSandboxPlugin(Star):
         return self._sandboxes[uid]
 
     # ── LLM 调用 ──────────────────────────────
-    async def _llm_chat(self, prompt: str, system_prompt: str = "") -> str:
-        """向星星诉说，等待回音"""
+    async def _llm_chat(self, prompt: str, system_prompt: str = "", timeout: float = 110.0) -> str:
+        """向星星诉说，等待回音（带超时保护，防止模型卡死拖垮整个工具调用）"""
         provider = None
         try:
             provider = self.context.get_using_provider()
@@ -105,15 +105,22 @@ class WriteSandboxPlugin(Star):
         if not provider:
             return ""
         try:
-            result = await provider.text_chat(
-                prompt=prompt,
-                system_prompt=system_prompt or None,
+            result = await asyncio.wait_for(
+                provider.text_chat(
+                    prompt=prompt,
+                    system_prompt=system_prompt or None,
+                    request_max_retries=2,
+                ),
+                timeout=timeout,
             )
             if hasattr(result, "completion_text"):
                 return result.completion_text or ""
             if isinstance(result, str):
                 return result
             return str(result)
+        except asyncio.TimeoutError:
+            logger.error(f"写作沙盒调用模型超时（>{timeout}s），已中止等待。")
+            return ""
         except Exception as e:
             logger.error(f"写作沙盒调用模型失败: {e}")
             return ""
@@ -165,6 +172,7 @@ class WriteSandboxPlugin(Star):
         mode: str = "generate",
         tag: str = "",
         work: str = "",
+        chapter: int = 0,
     ) -> str:
         """在独立写作沙盒中后台分节生成文字，任务开始即返回，全部写完会自动把完整文件推给用户。
 
@@ -173,12 +181,15 @@ class WriteSandboxPlugin(Star):
         长篇模式：用户提到作品名（如「写《雾都夜行》第3章」）时把作品名传入 work，
         正文会存进该作品的章节目录，并自动生成章节摘要、更新设定书。
         长文会自动分成每节约 4000 字的小节在后台逐节写；用户中途问进度时调用 sandbox_progress 工具。
+        重写指定章节时（如「重写第8章」）：mode=rewrite 且传入 chapter=8，写完后会覆盖该章原文件，
+        不会新增章节号。
 
         Args:
             instruction(string): 用户想要的内容描述，例如「她推门进来，雨还没干」「尺度拉高，重点写触感」。
-            mode(string): generate=新写一段（长篇模式下为新章节）；continue=接着上一段续写；rewrite=按新要求重写上一段。
+            mode(string): generate=新写一段（长篇模式下为新章节）；continue=接着上一段续写；rewrite=按新要求重写上一段/指定章节。
             tag(string): 可选，给这段文字起个名字，会用在文件名上。
             work(string): 可选，长篇作品名。传入则切换/新建该作品工作区；留空沿用当前激活作品。
+            chapter(int): 可选，目标章节号。rewrite 指定章节（如重写第8章→8）或 generate 指定位置时用；0=自动判断。
         """
         sandbox = self._get_sandbox(event)
         if not sandbox:
@@ -206,14 +217,20 @@ class WriteSandboxPlugin(Star):
             try:
                 rep = sandbox.render_character_audit(active_work)
                 if "没有发现" not in rep:
-                    char_audit_note = "\n\n【写前人物卡复核】\n" + rep + "\n（可以先让人家清理旧卡或补建缺卡，也可以直接开写♪）"
+                    char_audit_note = "\n\n【写前人物卡复核】\n" + rep + "\n（可以先让人家清理无关卡，也可以直接开写♪）"
             except Exception:
                 pass
 
-        # 长篇模式下先确定章节号（generate=新章，continue/rewrite=续写最近一章）
+        # 长篇模式下先确定章节号（generate=新章，continue/rewrite=续写/重写目标章）
         chapter_no = 0
         if active_work:
-            if mode == "generate":
+            # 目标章号优先级：工具参数 chapter > 指令文本解析（如「重写第8章」）
+            if not (chapter and chapter > 0):
+                chapter = self._parse_chapter_no(instruction)
+            if chapter and chapter > 0:
+                # 用户/主模型明确指定目标章号（如「重写第8章」→8）
+                chapter_no = int(chapter)
+            elif mode == "generate":
                 chapter_no = sandbox.next_chapter_no(active_work)
             else:
                 chapter_no = sandbox.latest_chapter_no(active_work) or 1
@@ -279,6 +296,21 @@ class WriteSandboxPlugin(Star):
     _CN_DIGITS = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
                   "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
     _CN_UNITS = {"十": 10, "百": 100, "千": 1000, "万": 10000}
+
+    @classmethod
+    def _parse_chapter_no(cls, text: str) -> int:
+        """从「重写第8章」「第八章」「第 12 章」等指令里解析目标章号；解析不到返回 0。"""
+        if not text:
+            return 0
+        m = re.search(r"(?:第|重写|写)([0-9零一二两三四五六七八九十百千]+)\s*章", text)
+        if not m:
+            m = re.search(r"([0-9零一二两三四五六七八九十百千]+)\s*章", text)
+        if not m:
+            return 0
+        s = m.group(1)
+        if s.isdigit():
+            return int(s)
+        return cls._parse_cn_amount(s) or 0
 
     @staticmethod
     def _parse_cn_amount(s: str) -> Optional[int]:
@@ -361,6 +393,7 @@ class WriteSandboxPlugin(Star):
         instruction = job["instruction"]
         tag = job["tag"]
         ch = job["chapter_no"]
+        mode = job.get("mode") or "generate"
         try:
             total = self._plan_sections(job)
             job["section_total"] = total
@@ -392,7 +425,8 @@ class WriteSandboxPlugin(Star):
                     return
                 job["current_chunk"] = chunk
                 if work:
-                    file_path = sandbox.append_chapter(work, ch, chunk, tag=tag or instruction)
+                    # 写作期间先落到独立暂存区（drafts/），不占正式章节号
+                    file_path = sandbox.append_draft(work, job["job_id"], chunk, tag=tag or instruction)
                 else:
                     file_path = sandbox.append_output(chunk, tag=tag or instruction)
                 job["file_path"] = str(file_path)
@@ -402,14 +436,26 @@ class WriteSandboxPlugin(Star):
                 parts_written.append(chunk)
                 job["section_idx"] = i
 
-            # 整章完成：摘要 + 设定书（也在后台做，不阻塞任何人）
+            # 整章完成：按模式落位 → 摘要 + 设定书（也在后台做，不阻塞任何人）
             if work:
                 full = "\n\n".join(parts_written)
+                # 目标章节号在任务启动时已确定（参数/指令解析/自动判断）：
+                #   rewrite=目标章号覆盖原文件（不新增章号）；generate=新章；continue=续写目标章
+                final_ch = job["chapter_no"] or 1
+                job["chapter_no"] = final_ch
+                # rewrite 时覆盖目标章；continue 追加旧文末尾；generate 新建
+                final_path = sandbox.finalize_chapter(
+                    work, job["job_id"], final_ch, tag=tag or instruction,
+                    append_mode=(mode == "continue"),
+                )
+                if final_path:
+                    file_path = final_path
+                    job["file_path"] = str(final_path)
                 summary = await self._chapter_summary(full)
                 if not summary:
                     summary = full[:200]
-                sandbox.upsert_chapter_summary(work, ch, summary)
-                await self._update_story_state(sandbox, work, full, ch)
+                sandbox.upsert_chapter_summary(work, final_ch, summary)
+                await self._update_story_state(sandbox, work, full, final_ch)
                 # 自动提炼人设卡：按出现次数/置信度判断，达标且无同名卡才建卡
                 try:
                     created = await self._auto_extract_characters(sandbox, work, full)
@@ -419,12 +465,32 @@ class WriteSandboxPlugin(Star):
                     logger.warning(f"自动提炼人设卡失败: {e}")
 
             job["status"] = "done"
-            # 口水词小哨兵：整章/整段完成后自动扫一遍重复词，随通知附上
+            # 口水词小哨兵：整章/整段完成后自动扫一遍重复词，随通知附上；
+            # 检出问题时交给 LLM 判断并做「一轮」自动修订（防无限返工，不再二次检查）
             try:
                 full_text = "\n\n".join(parts_written)
                 repeat_report = sandbox.detect_repeated_words(full_text, work=work)
                 if repeat_report:
                     job["repeat_report"] = repeat_report
+                    revised, revise_note = await self._revise_repeated(sandbox, full_text, work)
+                    if revise_note and revised != full_text:
+                        job["revise_report"] = revise_note
+                        # 落位：generate/rewrite/短篇直接覆盖正式文件；
+                        # continue 追加模式另存修订版，避免冲掉旧文
+                        try:
+                            if job.get("file_path"):
+                                fp = Path(job["file_path"])
+                                if fp.exists():
+                                    cur = fp.read_text(encoding="utf-8").rstrip()
+                                    if cur != full_text.rstrip():
+                                        # 续写/追加场景：文件里还有本次之外的内容 → 另存修订版，避免冲掉旧文
+                                        rev_path = fp.with_name(fp.stem + "_哨兵修订版" + fp.suffix)
+                                        rev_path.write_text(revised.rstrip() + "\n", encoding="utf-8")
+                                        job["revise_path"] = str(rev_path)
+                                    else:
+                                        fp.write_text(revised.rstrip() + "\n", encoding="utf-8")
+                        except Exception as e:
+                            logger.warning(f"哨兵修订落盘失败: {e}")
             except Exception as e:
                 logger.warning(f"口水词检测失败: {e}")
             await self._notify(job, failed=False)
@@ -475,12 +541,12 @@ class WriteSandboxPlugin(Star):
             return ""
         cards: list[str] = []
         for n in names:
-            card = sandbox.load_character(n, work)
+            card = sandbox.load_character(n, work, work_only=True)
             if card:
                 cards.append(sandbox.render_character(card))
         if not cards:
             return ""
-        return "【本章选用全局人设卡（经选角判断自动引入）】\n" + "\n\n".join(cards)
+        return "【本章选用人设卡（经选角判断自动引入）】\n" + "\n\n".join(cards)
 
     async def _write_section(
         self,
@@ -636,6 +702,10 @@ class WriteSandboxPlugin(Star):
                     body += f"\n\n【自动提炼人设卡】{job['extract_report']}"
                 if job.get("repeat_report"):
                     body += "\n\n" + job["repeat_report"]
+                if job.get("revise_report"):
+                    body += f"\n\n【口水词小哨兵·自动修订】{job['revise_report']}"
+                    if job.get("revise_path"):
+                        body += f"\n修订版另存：{job['revise_path']}"
                 chunk = job.get("current_chunk") or ""
                 if chunk:
                     body += "\n\n【末尾节选】\n" + chunk[-400:]
@@ -643,6 +713,87 @@ class WriteSandboxPlugin(Star):
             await self.context.send_message(job["session"], chain)
         except Exception as e:
             logger.error(f"后台写作通知发送失败: {e}")
+
+    async def _revise_repeated(self, sandbox: Sandbox, full_text: str, work: str) -> tuple[str, str]:
+        """口水词小哨兵自动修订：把检查结果交给 LLM 判断，输出编辑指令后由程序精确应用。
+        只执行一轮（防无限返工）；仅替换能在正文中唯一定位的片段。返回 (修正后全文, 修订说明)。"""
+        res = sandbox.analyze_repeated(full_text, work)
+        if not res["dup"] and not res["freq"]:
+            return full_text, ""
+        paras = [p.strip() for p in full_text.splitlines() if p.strip()]
+
+        def _ctx(no: int, radius: int = 1) -> str:
+            """取第 no 段及其前后 radius 段，拼成带段号的上下文片段。"""
+            segs = []
+            for k in range(max(1, no - radius), min(len(paras), no + radius) + 1):
+                mark = "→" if k == no else " "
+                segs.append(f"{mark}[段{k}] {paras[k - 1][:200]}")
+            return "\n".join(segs)
+
+        bundle: list[str] = []
+        for i, d in enumerate(res["dup"][:8], 1):
+            bundle.append(
+                f"── 对白语义重复 #{i}（第{d['a_no']}段 ≈ 第{d['b_no']}段，相似度{d['ratio']}）──\n"
+                f"【前一处】\n{_ctx(d['a_no'])}\n【后一处】\n{_ctx(d['b_no'])}"
+            )
+        for f in res["freq"][:8]:
+            pos = "、".join(str(p) for p in f["paras"][:4])
+            bundle.append(
+                f"── 旁白高频词「{f['word']}」×{f['count']}（出现于第 {pos} 段）──\n"
+                + "\n".join(_ctx(p) for p in f["paras"][:3])
+            )
+        context_block = "\n\n".join(bundle)
+
+        prompt = (
+            "你是小说编辑，下面是某章『口水词小哨兵』的检查结果与问题片段上下文。\n"
+            "请判断哪些值得修改：真正造成阅读疲劳的语义重复对白、过密的旁白高频词；\n"
+            "轻微或正常的重复不要动。\n\n"
+            "输出一个 JSON 数组（不要输出任何其他文字），每项：\n"
+            "{\"find\": \"正文里能唯一找到的连续原文片段\", \"replace\": \"替换后的文本\"}\n\n"
+            "要求：\n"
+            "1. find 必须是正文中逐字存在的连续片段，能在全文唯一定位（建议 6~60 字）；\n"
+            "   找不到唯一片段就少写几条，不要编造。\n"
+            "2. 高频词：只把连续密集出现的其中 1~2 处换成同义表达，不要全部替换、不要删句。\n"
+            "3. 对白重复：改写靠后一处，措辞变化但语义与人物语气不变。\n"
+            "4. 不删改剧情、设定、人名；不动对白外的叙述结构。\n"
+            "5. 最多 15 条。\n\n"
+            f"【检查结果与上下文】\n{context_block}"
+        )
+        raw = await self._llm_chat(prompt, system_prompt="你只输出 JSON 数组，不要输出任何其他文字。")
+        raw = self._clean(raw)
+        edits: list[dict] = []
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                edits = [e for e in parsed if isinstance(e, dict)]
+        except Exception:
+            m = re.search(r"\[[\s\S]*\]", raw)
+            if m:
+                try:
+                    parsed = json.loads(m.group(0))
+                    if isinstance(parsed, list):
+                        edits = [e for e in parsed if isinstance(e, dict)]
+                except Exception:
+                    edits = []
+        if not edits:
+            return full_text, "哨兵检查到问题，但自动修订未能生成可靠编辑指令，已保留原文。"
+        new_text = full_text
+        applied = skipped = 0
+        for ed in edits:
+            find = str(ed.get("find", "") or "").strip()
+            replace = str(ed.get("replace", "") or "")
+            if not find or find == replace:
+                skipped += 1
+                continue
+            if new_text.count(find) == 1:
+                new_text = new_text.replace(find, replace)
+                applied += 1
+            else:
+                skipped += 1
+        if applied == 0:
+            return full_text, "哨兵检查到问题，但编辑指令未能命中正文，已保留原文。"
+        note = f"哨兵已做一轮自动修订：应用 {applied} 处、跳过 {skipped} 处。"
+        return new_text, note
 
     # ═══════════════════════════════════════════
     # 工具 1.5：沙盒进度（后台任务状态查询）
@@ -796,9 +947,22 @@ class WriteSandboxPlugin(Star):
         reference = sandbox.render_story_memory(work)[:1500]
         for c in chars:
             nm = str(c.get("name") or "").strip()
-            if not nm or c.get("confidence", 0) < 0.45 or c.get("mention_count", 0) < 2:
+            if not nm or c.get("confidence", 0) < 0.6 or c.get("mention_count", 0) < 3:
                 continue
             if sandbox.load_character(nm, work):
+                continue
+            # 已有卡（含别名）查重：防止同一角色换称呼被重复提炼
+            duplicate = False
+            for card_name in sandbox.list_work_characters(work):
+                card = sandbox.load_character(card_name, work)
+                if not card:
+                    continue
+                basic = card.get("basic") if isinstance(card.get("basic"), dict) else {}
+                known = [str(basic.get("name") or "")] + [str(a) for a in (basic.get("aliases") or [])]
+                if any(nm == k or (k and nm in k) for k in known if k):
+                    duplicate = True
+                    break
+            if duplicate:
                 continue
             role_hint = str(c.get("role_hint") or "配角")
             traits = str(c.get("traits") or "").strip()
@@ -1225,7 +1389,7 @@ class WriteSandboxPlugin(Star):
             prompt = build_outline_revise_prompt(
                 instruction=instruction,
                 current_outline=json.dumps(current, ensure_ascii=False, indent=2),
-                reference=sandbox.render_story_memory(active)[:3000],
+                reference=sandbox.render_story_memory(active)[:1500],
             )
             raw = await self._llm_chat(prompt, system_prompt="你只输出 JSON，不要输出任何其他文字。")
             raw = self._clean(raw)
@@ -1256,7 +1420,7 @@ class WriteSandboxPlugin(Star):
             try:
                 rep = sandbox.render_character_audit(active)
                 if "没有发现" not in rep:
-                    audit_note = "\n\n【微调后人物卡复核】\n" + rep + "\n（确认大纲后记得清理旧卡/补建缺卡♪）"
+                    audit_note = "\n\n【微调后人物卡复核】\n" + rep + "\n（确认大纲后记得清理无关卡♪）"
             except Exception:
                 pass
             return (
@@ -1269,7 +1433,7 @@ class WriteSandboxPlugin(Star):
             return "写大纲需要说明要求，例如「十章，暧昧转露骨，主角身世是核心悬念」。"
         prompt = build_outline_prompt(
             instruction=instruction,
-            reference=sandbox.render_story_memory(active)[:3000],
+            reference=sandbox.render_story_memory(active)[:1500],
         )
         raw = await self._llm_chat(prompt, system_prompt="你只输出 JSON，不要输出任何其他文字。")
         raw = self._clean(raw)
@@ -1321,8 +1485,8 @@ class WriteSandboxPlugin(Star):
         「看看有哪些人设卡」时调用。生成后写正文时，会按大纲章节节点的出场角色自动注入人设卡。
 
         Args:
-            action(string): create=按描述生成新卡（默认）；list=列出可用卡；view=查看指定卡；update=按新描述重写指定卡；delete=删除指定卡；audit=复核当前作品人物卡与大纲一致性（找旧卡残留/缺卡/无关信息）。
-            description(string): create/update 时必填，一句话角色描述，如「夜总会老板，表面和气，背地里是情报贩子，右眼角有疤」。
+            action(string): create=按描述生成新卡（默认）；list=列出可用卡；view=查看指定卡；update=按描述做字段级更新（只改动点名字段，其余原样保留，纯代码不走模型）；delete=删除指定卡；audit=复核当前作品人物卡（只查是否放入了无关的卡：旧卡残留/夹带无关人物）。
+            description(string): create 时一句话角色描述，如「夜总会老板，表面和气，背地里是情报贩子，右眼角有疤」；update 时写字段指令，如「删除称呼方式；口头禅改为 不必。」。
             name(string): view/update/delete 时必填，角色名。
             scope(string): global=存全局（跨作品可调）；work=存当前作品（默认，仅本作品可见）。
             work(string): 可选，scope=work 时指定作品；留空沿用当前激活作品。
@@ -1372,11 +1536,42 @@ class WriteSandboxPlugin(Star):
                 return "复核人物卡需要先激活一个作品（给 work 参数或先激活）。"
             return sandbox.render_character_audit(active)
 
-        # create / update
+        # update：纯代码字段合并，不进模型、不读设定书，只动点名字段
+        if action == "update":
+            if not name.strip():
+                return "update 需要指定角色名。"
+            if not description.strip():
+                return "update 需要写明要改哪些字段，例如「删除称呼方式；口头禅改为 不必。」"
+            old = sandbox.load_character(name.strip(), active)
+            if old is None:
+                return f"找不到角色「{name.strip()}」的旧卡，无法走纯代码更新。"
+            ok, card, changes = sandbox.apply_character_edit(old, description)
+            if not ok:
+                return "更新未执行：" + "；".join(changes)
+            basic = card.get("basic") if isinstance(card.get("basic"), dict) else {}
+            basic["name"] = name.strip()
+            card["basic"] = basic
+            sandbox.save_character(card, scope, active)
+            extra = ""
+            if active:
+                foreign = sandbox.check_card_foreign(card, active)
+                if foreign:
+                    extra = (
+                        "\n\n⚠️ 这张卡疑似夹带名单外人物关联（故事里未出场/未提到）："
+                        + "、".join(f"「{f}」" for f in foreign)
+                        + "\n要不要人家把卡改一下，清掉这些关联？"
+                    )
+            return (
+                "人设卡已更新♪（纯代码字段合并，未走模型、未参考设定书）\n变更：\n- "
+                + "\n- ".join(changes)
+                + "\n\n"
+                + sandbox.render_character(card)
+                + extra
+            )
+
+        # create：仍按描述生成新卡
         if not description.strip():
             return "生成人设卡需要角色描述，例如「夜总会老板，表面和气，背地里是情报贩子」。"
-        if action == "update" and name.strip():
-            sandbox.delete_character(name.strip(), scope, active)
         reference = sandbox.render_story_memory(active)[:1500] if active else ""
         prompt = build_character_prompt(description=description, reference=reference)
         raw = await self._llm_chat(prompt, system_prompt="你只输出 JSON，不要输出任何其他文字。")
@@ -1400,8 +1595,6 @@ class WriteSandboxPlugin(Star):
         basic = card.get("basic") if isinstance(card.get("basic"), dict) else {}
         if not basic.get("name"):
             basic["name"] = name.strip() or "未命名"
-        if name.strip() and action == "update":
-            basic["name"] = name.strip()
         card["basic"] = basic
         sandbox.save_character(card, scope, active)
         extra = ""
