@@ -1,562 +1,109 @@
-# 写作沙盒 · 昔涟 — 开发方案（工作对照文件）
+# 写作沙盒 · 昔涟 — 项目导航（精简版）
 
-> 本文件是插件的唯一方案基准，开发时随时对照；需求变更先改这里，再动代码。
+> 本文件是插件唯一方案基准。已交付功能只记「位置与用法」，不再记过程；
+> 需求变更先改这里，再动代码。详细设计决策见 git 历史（提交信息带节号）。
 
-## 1. 定位
+## 0. 开发铁律
 
-私聊专属的「委托式写作沙盒」：汐小姐用自然语言吩咐，昔涟作为背后的手，以
-**独立上下文 + 指定提示词 + 约束 + 风格卡** 产出期望文字，并**自动落盘为 txt**。
-
-与主聊天、关系本、陪伴记忆完全隔离，互不污染。
-
-## 2. 交互方式（委托式，无命令前缀）
-
-不需要记忆任何指令。自然说话即可：
-
-- 「写一段她推门进来，雨还没干」 → 按当前风格卡产出，落盘 txt
-- 「这段太素了，尺度拉高，重点写触感」 → 调整提示词参数并重写
-- 「换第一人称，节奏快一点」 → 改约束，下次立即生效
-
-所有「调提示词 / 改约束 / 换风格」封装为工具动作，由主模型（昔涟）根据对话
-内容自主调用，用户只描述「要什么效果」。
-
-### 工具清单（llm_tool，主模型可调用）
-
-| 工具 | 作用 |
-|------|------|
-| `沙盒写作` | 按风格卡+约束+沙盒历史生成/续写/改写一段文字，落盘 txt |
-| `沙盒设置` | 修改约束项（长度/视角/尺度/忌讳词/描写偏好等） |
-| `沙盒收藏` | 把上一段输出存入 `favorites/`，供风格学习加权 |
-| `沙盒学习素材` | 从 `library/` + `favorites/` 提炼风格卡 |
-| `沙盒状态` | 查看当前风格卡与约束 |
-| `沙盒大纲` | 为长篇作品编写/微调/重写/查看大纲（action=write 全新生成 / revise 基于现有大纲局部微调 / confirm 确认草稿 / discard 丢弃 / view 查看 / note 挂灵感便签 / link 章节接续） |
-| `沙盒人设` | 统一格式人设卡生成/查看/删除/复核（scope=global 跨作品 / work 仅当前作品；action=audit 复核人物卡与大纲/正文一致性） |
-| `sandbox_cleanup` | 旧稿清理：list 列超过 N 天未修改的文件（带编号），delete 按编号删（需先过目） |
-| `沙盒重置` | 清空沙盒历史（可连约束风格卡一起清） |
-
-## 3. 独立沙盒
-
-- 沙盒历史存 `sandbox_history.jsonl`（role/content 序列），只属于沙盒会话。
-- 每次生成 = 系统提示词 + 风格卡 + 约束 + 沙盒历史 + 本次指令 → 独立请求。
-- 产出文本落盘 `outputs/YYYY-MM-DD_HHMM_标题.txt`，回复中给摘要+路径。
-
-## 4. 提示词与约束（可编辑，不改代码）
-
-约束表存 `constraints.json`，提示词模板存 `prompts.py`：
-
-| 约束项 | 默认 |
-|--------|------|
-| 长度 | 300~800 字 |
-| 人称视角 | 第二人称主视角 |
-| 尺度档位 | 露骨（可调：暧昧/露骨/极限） |
-| 忌讳词 | []（生成前过滤） |
-| 描写偏好 | 感官细节六成、心理三成 |
-| 节奏 | 慢热 |
-| 固定人格特征 | 保留「♪」「人家」等昔涟底色 |
-
-## 5. 素材学习 · 风格卡（2026-09-11 定稿）
-
-**边界**：风格卡只教「怎么写」，不管「写什么」。语气、情绪底色、题材、
-具体意象词一律**不收录**——它们跟剧情和人设走，收了反而适配度低。
-
-**方式A · 静态风格卡（先做）**
-`library/` 放素材（txt/md）→ `沙盒学习素材` 把素材交模型提炼为 JSON 风格卡。
-每次生成注入风格卡，稳定省 token；素材更新后重新学习即换风格。
-
-### 5.1 捕获维度（仅笔法，跨剧情稳定）
-
-| 字段 | 捕获什么 |
-|------|----------|
-| sentence_style 句式结构 | 长短句偏好、断句、省略号/破折号/排比的使用 |
-| vocab_prefs 词汇偏好 | 高频词、书面 vs 口语、特定用词习惯 |
-| description_focus 描写侧重与密度 | 感官/心理/动作/环境比例、颗粒度粗细 |
-| person_habit 人称与视角 | 叙述视角、距离感 |
-| rhythm 节奏 | 段落长短、推进快慢 |
-| sense_focus 感官侧重 | 视觉/触觉/听觉/嗅觉谁优先 |
-| scale_floor 尺度与露骨度 | 器官/体液用词倾向、直白度 |
-| metaphor_style 比喻方式 | 怎么用比喻、意象密度 |
-
-**明确不收录**：语气/情绪底色 ❌ 题材 ❌ 具体意象词（雾都/旧船票这类）❌
-
-### 5.2 学习方法（不做统计共识）
-
-- **主卡只收稳定笔法**：某特征在素材里反复出现 → 收录；单篇出彩但不普遍 →
-  不进主卡，单独归档进 extras 按需调用。
-- **强度标记**：每字段标「强 / 有 / 无」，不是统计式置信度。「有」就是有，
-  一篇明确的示例句就能锚定，不需要凑共识。
-- **示例句锚定**：每个特征配 1~2 句原文例句，抽象描述不如原文例句可复现。
-
-### 5.3 落地形态
-
-```json
-style_card.json
-{
-  "meta": { "learned_at": "...", "source_count": 3, "favorite_ratio": 0.5 },
-  "core":  { 字段: { "desc": "...", "examples": [...], "strength": "强/有/无" } },
-  "samples": [ "2~3 条高权重完整示例段（few-shot）" ],
-  "extras": [ { "tag": "来源", "text": "单篇特色样本，不并主卡" } ]
-}
-```
-
-- 生成时注入 `core` + `samples`（few-shot）；`extras` 只在点名时用，省 token 不丢风味。
-- 收藏 `favorites/` 素材权重最高，优先体现其笔法。
-
-**方式B · 动态检索（二期，暂不做）**
-素材量大后切块向量化入 knowledge_base，按主题检索 few-shot。
-
-> 风格卡「如何提炼才算合适」的细节，待沙盒跑通后与汐小姐专门讨论再定。
-
-## 6. 目录结构
-
-```
-astrbot_plugin_write_sandbox/
-├── PLAN.md            ← 本文件（方案基准）
-├── metadata.yaml
-├── main.py            ← 插件入口 + llm_tool 注册 + 14 个注册壳（39 行，2026-09-25 拆分）
-├── handlers/          ← 业务逻辑 Mixin（2026-09-25 由 main.py 拆分，见第 12 节）
-│   ├── __init__.py
-│   ├── base.py        ← BaseMixin 基础设施 + PLUGIN_ID
-│   ├── write.py       ← WriteMixin：sandbox_write/progress/cancel 全链路
-│   ├── outline.py     ← OutlineMixin：sandbox_outline
-│   ├── character.py   ← CharacterMixin：sandbox_character/extract_characters
-│   ├── learn.py       ← LearnMixin：sandbox_learn/favorite
-│   └── misc.py        ← MiscMixin：set/status/style_combo/work/cleanup/reset
-├── core/              ← 沙盒核心包（2026-09-21 由 core.py 拆分）
-│   ├── __init__.py    ← 导出 Sandbox（门面）
-│   ├── sandbox.py     ← class Sandbox（7 个 Mixin 组合）
-│   ├── constants.py   ← 全部常量（目录名/默认配置/维度标签）
-│   ├── storage.py     ← 状态读写、history、outputs
-│   ├── style.py       ← 风格卡、组合卡、约束
-│   ├── works.py       ← 作品工作区、大纲、章节、设定书
-│   ├── characters.py  ← 人设卡全套（含字段合并 update）
-│   ├── library.py     ← 素材库、收藏
-│   ├── analysis.py    ← 重复检测、对话提取、白名单
-│   └── cleanup.py     ← 过期文件清理
-├── prompts.py         ← 系统提示词模板
-└── data/plugin_data/astrbot_plugin_write_sandbox/
-    ├── sandbox_history.jsonl
-    ├── style_card.json
-    ├── constraints.json
-    ├── outputs/*.txt
-    ├── library/*.txt
-    ├── favorites/*.txt
-    ├── style_cards/*.json       ← 风格卡库（组合卡用）
-    ├── style_card.json / style_combo.json / constraints.json
-    └── stories/
-        └── 《作品名》/   ← 长文工作区（每篇独立，互相隔离）
-            ├── chapter_summaries.json   ← 逐章摘要（追加流水，不可变）
-            ├── story_state.json         ← 设定书（当前状态，覆盖更新）
-            ├── outline.json             ← 大纲（全局脉络 + 分章节点）
-            ├── outline.pending.json     ← 大纲待确认草稿
-            ├── story_config.json        ← 章节接续模式等配置
-            ├── characters/*.json        ← 作品级人设卡（仅本作品可见）
-            ├── drafts/*.txt             ← 分节草稿
-            └── chapters/*.txt           ← 各章原文
-```
-（另有全局人设卡目录 `用户目录/characters/*.json`，跨作品可调）
-
-## 7. 里程碑
-
-- [x] M0 方案讨论与落盘
-- [x] M1 插件骨架：注册 + 沙盒核心 + 生成落盘 txt
-- [x] M2 约束配置 + 提示词文件（可改不碰代码）
-- [x] M3 素材学习：风格卡提炼 + 收藏闭环
-- [x] M4 打磨：续写/改写/边界兜底（超长、空素材、报错、重置）
-- [x] M5 长文连贯：设定书 + 逐章摘要 + 大纲 + 人设卡（见第 9 节，已全部上线）
-- [x] M6 模块化拆分：core.py → core/ 包（见第 10 节，已完成并重载验证）
-- [x] M7 局部修改能力优化：正文局部修订 + 角色卡/大纲「说明书模式」（见第 11 节，已上线）
-
-## 8. 开发铁律（对照 dev-workflow）
-
-1. 改代码一律 safe_edit / multi_edit，自动备份+语法检查+失败回滚。
+1. 改代码一律 safe_edit / multi_edit，自动备份 + 语法检查 + 失败回滚。
 2. 改前 git_status / safe_read 确认现状；改后 lint_runner 检查。
 3. 需求变更先改本文件，再动代码。
 4. 写作类产出先给规划（已完成/还差/本轮接哪一截），禁止每次从头。
+5. 交付打【汐小姐要求】标注；昔涟自行补充标【昔涟补充】，冲突以汐小姐要求为准。
 
-## 9. M5 长文连贯机制：设定书 + 逐章摘要（2026-09-11 定稿）
+## 1. 功能清单速查表（全部已交付）
 
-长篇写作的连贯性靠「逐章摘要 + 设定书」双文件维护，写入前先与汐小姐讨论定稿，
-本轮落盘；摘要预算等遇到实际问题再调。
+### 1.1 工具（14 个 llm_tool）
 
-### 9.1 摘要：逐章追加，永不重写
+| 功能 | 工具 | 一句话说明 |
+|------|------|-----------|
+| 沙盒写作 | sandbox_write | 按风格卡+约束+作品记忆 生成/续写/改写/重写/局部修订，落盘 txt；mode=generate/continue/rewrite/revise |
+| 写作进度 | sandbox_progress | 查后台分节任务进度 |
+| 写作取消 | sandbox_cancel | 中断后台任务，已写部分保留 |
+| 约束设置 | sandbox_settings | 改长度/人称/尺度/忌讳词/描写偏好/节奏/人格保留 |
+| 沙盒状态 | sandbox_status | 查看当前风格卡与约束 |
+| 风格学习 | sandbox_learn | 从 library/ + favorites/ 提炼风格卡；有激活作品则存作品级 |
+| 素材收藏 | sandbox_favorite | 收藏上一段输出，风格学习里权重最高 |
+| 大纲 | sandbox_outline | write/revise 走说明书 → save 校验 → confirm/discard；note 灵感便签；link 章节接续 |
+| 人设卡 | sandbox_character | create/view/update/delete/audit/save；全局/作品双存储 |
+| 角色提炼 | sandbox_extract_characters | 从文本提炼人设卡，阈值 0.6/3，结果标注 新建/跳过/龙套 |
+| 风格组合 | sandbox_style_combo | 多卡融合 + 单维度指定来源，按激活作品隔离 |
+| 作品工作区 | sandbox_work | 作品切换/新建；action=config 调注入与提炼开关 |
+| 旧稿清理 | sandbox_cleanup | 列 30 天前旧稿 → 用户过目 → 按编号删 |
+| 沙盒重置 | sandbox_reset | 清空历史（可连约束风格卡一起清） |
 
-`chapter_summaries.json` 是**追加流水，不可变**：
+### 1.2 核心机制（非工具，已交付）
 
-```json
-{ "summaries": [ { "ch": 1, "summary": "第1章摘要(≤300字)" }, ... ] }
-```
+| 机制 | 位置 | 一句话说明 |
+|------|------|-----------|
+| 独立沙盒 | core/storage.py | sandbox_history.jsonl，与主聊天完全隔离 |
+| 风格卡 | core/style.py | 主卡 core+samples 注入、extras 点名才用；只教写法不教内容 |
+| 作品工作区 | core/works.py | stories/《作品》/ 独立目录，篇与篇互不可见 |
+| 逐章摘要 | core/works.py | chapter_summaries.json 追加流水不可变，单章 ≤300 字 |
+| 设定书 | core/works.py | story_state.json 当前状态快照，覆盖更新 |
+| 大纲 | core/works.py | outline.json + pending 草稿先行，未确认拦截开写 |
+| 章节接续 | core/works.py | story_config.json chapter_link=continuous/break/auto |
+| 人设卡双存储 | core/characters.py | 全局 + 作品两处，作品卡优先（近的盖远的） |
+| 全局卡选角 | handlers/write.py | 每章选一次，默认不选、最多 3 张、宁缺毋滥 |
+| 口水词哨兵 | handlers/write.py | 完稿自动扫口水词，只提示不自动改 |
+| 正文局部修订 | handlers/write.py | 编辑指令 + 唯一定位精确应用，未点名内容不动 |
+| 说明书模式 | prompts.py | CHARACTER_GUIDE/OUTLINE_GUIDE；黑盒生成改为主模型编写 + 代码校验收单 |
+| 作品级风格卡 | core/style.py | 作品三件套 style_card/style_cards/combo，无卡回退全局 |
+| 注入/提炼开关 | core/works.py | story_config：inject_memory / inject_characters / auto_extract（默认关） |
 
-- 每章完稿后，只做一次「原文 → 摘要」生成，**追加**新条目，旧条目一个字节不动。
-- **没有总量上限，只有单章上限**（默认 300 字）→ 不存在为了塞预算而二次压缩
-  旧摘要，避免信息逐层丢失。
-- 不写超长文时，写新章全量注入全部逐章摘要；真写到上百章再对「已完结早期弧线」
-  做一次性归档（只归档一次，不进循环）——列为扩展点，现在不做。
+## 2. 功能代码导航
 
-### 9.2 设定书：当前状态快照，覆盖更新
-
-`story_state.json` 是**当前状态快照**，记录「现在仍然成立的状态」：
-
-```json
-{
-  "meta": { "title": "...", "current_chapter": 3 },
-  "world": { "地点": "...", "规则": "..." },
-  "characters": [ { "name": "...", "状态": "...", "关系": "...", "秘密": "..." } ],
-  "foreshadowing": [ { "desc": "...", "status": "未收/已收" } ],
-  "unresolved": [ "...未解决问题..." ]
-}
-```
-
-- 每章完稿后，用「最新状态」**覆盖更新**旧值（如：人物状态、伏笔账本未收→已收）。
-- 摘要是流水、设定书是快照，**各管各的，不重复写**：
-  - 「已经过去的事」→ 进摘要（发生了什么、关键台词、时间地点推进）
-  - 「现在仍然成立的状态」→ 进设定书（人物当前状态/关系/秘密、世界观、伏笔账本、未解决问题）
-  - 摘要不写人物当前外貌；设定书不写剧情流水。
-
-### 9.3 每篇文独立工作区，严格隔离
-
-```
-stories/
-├── 《作品A》/ chapter_summaries.json + story_state.json + chapters/
-└── 《作品B》/ ...  各自独立，互不可见
-```
-
-- 写文指令带作品名，沙盒切换到对应工作区，**只加载它自己的摘要 + 设定书**。
-- 提示词加防串句：「只参考《作品A》的资料，禁止引入其他作品内容」。
-- 唯一跨文共享的是**风格卡 / 学习素材**（写作风格本就跨文复用），剧情记忆一律按文隔离。
-- 正式长文**不再依赖「最近 40 条聊天历史」窗口**（短篇即兴可继续用），
-  连贯性只认作品工作区里的摘要 + 设定书，防止 A 文历史串进 B 文。
-
-### 9.4 摘要提示词骨架（防漏防混）
-
-```text
-你是剧情摘要员。任务：把「新章节」压缩为单章摘要，追加进章节摘要列表。
-【必须记录】角色属性/关系/状态变化，情节关键节点与结果，时间地点推进，
-新埋或触发的伏笔，未解决问题。
-【禁止记录】环境渲染、修辞描写、对话原文（除非关键台词）、临场动作（坐下/喝水）。
-【硬规则】单章摘要 ≤300 字；不修改任何旧摘要；输出只含新增一条。
-输出前自检：是否遗漏新增角色、角色受伤/死亡、关系变化、伏笔、时间跳跃？遗漏则补上。
-```
-
-### 9.5 M5 里程碑拆分
-
-- [x] M5.1 作品工作区：目录切换 + 隔离 + 防串提示词
-- [x] M5.2 逐章摘要：完稿后生成单章摘要并追加
-- [x] M5.3 设定书：完稿后覆盖更新状态/伏笔账本
-- [x] M5.4 注入：写新章时全量注入摘要 + 设定书
-- [x] M5.5 大纲（2026-09-12）：`outline.json` 全局脉络+分章节点，写正文注入当前章节点
-
-### 9.6 大纲机制（2026-09-12 定稿，JSON 结构）
-
-`outline.json` 与摘要/设定书并列存放，管「接下来要写什么」：
-
-```json
-{
-  "meta": {
-    "title": "作品名", "premise": "一句话核心设定", "theme": "主题",
-    "tone": "整体氛围基调",
-    "arcs": ["故事弧线1", "故事弧线2"],
-    "characters": [ { "name": "...", "role": "定位", "arc": "人物弧线" } ],
-    "scale_map": { "1-3": "暧昧", "4-6": "露骨" }
-  },
-  "chapters": [
-    { "ch": 1, "title": "...", "summary": "本章要点",
-      "plot_points": ["情节节点"], "characters": ["出场角色"],
-      "tone": "基调", "scale": "暧昧|露骨|极限",
-      "cliffhanger": "结尾钩子", "notes": "伏笔备注" }
-  ]
-}
-```
-
-- **写入（草稿先行，2026-09-13 调整）**：`沙盒大纲` 工具，独立提示词（剧情架构师）生成 JSON，
-  先落盘为**待确认草稿**（`outline.pending.json`），返回完整大纲供审核；用户确认后再
-  `action=confirm` 才落盘为正式 `outline.json`。未确认前写正文会被拦截，
-  避免「大纲没过目就直接开写」导致设定漏写/逻辑硬伤。
-- **确认/丢弃**：`沙盒大纲` action=confirm 把草稿转正式；action=discard 丢弃草稿。
-  action=view 时优先展示待确认草稿（带「待确认」提示），无草稿才展示正式大纲。
-- **正文不受影响**：正文一章直接写完、整章交付（不拆成一截截交），拆细只针对大纲设定审核。
-- **读取分两级**：`render_outline` 看全局（全部章节节点）；`render_chapter_outline` 写正文时只注入
-  当前章节点 + 全局脉络概要（premise/arcs/scale_map），专注本章又不丢全局。
-- **与摘要/设定书分工**：摘要是「已发生的过去」、设定书是「现在的状态」、大纲是「将要写什么」，
-  三者各管一段，不重复写入。
-- 章节节点缺失时回退到编号最近节点，避免注入空；大纲可随时重写覆盖。
-
-### 9.7 人设卡机制（2026-09-12 定稿，统一格式 + 双存储）
-
-人设卡提供统一固定条目，支持「一句话描述 → 一键生成整套卡」，供配角批量建卡。
-
-```json
-{
-  "basic":     { "name", "aliases", "gender", "age", "identity", "appearance", "personality", "quirks" },
-  "background":{ "origin", "motivation", "secrets", "relations": [{name, relation, note}] },
-  "story":     { "role", "arc", "plot_hooks", "scale_role" },
-  "speech":    { "tone", "catchphrases", "address_style" },
-  "meta":      { "scope": "global|work", "work", "schema_version", "created_at" }
-}
-```
-
-- **双存储**：全局卡 → `用户目录/characters/`；作品卡 → `stories/《作品》/characters/`。
-- **读取优先级**：作品卡 > 全局卡（近的盖远的）。
-- **工具 `沙盒人设`**：create/list/view/update/delete，scope 决定存哪，work 指定作品。
-- **写作联动**：写正文时按大纲章节节点的「出场角色」自动加载人设卡注入，
-  只注入本章出场角色，不撑爆上下文；没建卡的出场角色提示按上下文自由处理。
-- **与大纲/摘要/设定书分工**：大纲管「接下来写什么」、人设卡管「角色是谁」，
-  摘要管已发生、设定书管当前状态，四者各管一段。
-
-### 9.8 写作体验小部件（2026-09-13 定稿，四样）
-
-#### 9.8.1 章节接续（按作品开关）
-
-- 每个作品存 `story_config.json`：`{ "chapter_link": "auto" }`。
-- `chapter_link` 三档：
-  - `continuous` 连续叙事：续写时贴上一章结尾三行，维持连贯。
-  - `break` 断章收尾：上一章在情绪最高处收住，续写**不贴旧结尾**，
-    只给本章大纲的「氛围引子」（tone / cliffhanger / 灵感便签），避免接错气氛。
-  - `auto`（默认）：有灵感便签或结尾钩子就按 break 给引子，否则按 continuous 贴结尾。
-- 设置入口：`sandbox_outline` action=link，mode=continuous|break|auto。
-
-#### 9.8.2 废稿清理
-
-- 新工具 `sandbox_cleanup`：
-  - action=list：列出 outputs/ 与各作品 chapters/ 里 mtime 超过 30 天的旧文件（编号+时间+大小）。
-  - action=delete：按编号删除（需要用户先看过清单、明确点名才删）。
-- 原则：沙盒不丢稿，旧稿由汐小姐定期勾选清理；删除前必须过目。
-
-#### 9.8.3 口水词小哨兵
-
-- 整章写完（后台任务完成）后自动扫描全文：
-  - 内置口水词表（轻轻/仿佛/缓缓/似乎/笑了笑/微微/一点/有些/像是/终于/慢慢/眼神/嘴角/忍不住/悄悄…）
-  - 高频重复的 2-4 字词也提示。
-  - 报告出现次数 + 所在段落号，随完成通知附上。
-- 定位：只提示不自动改稿，汐小姐决定要不要修。
-
-#### 9.8.4 灵感便签（绑大纲）
-
-- 大纲章节节点新增 `mood` 字段（灵感便签/氛围引子，可多条）。
-- `sandbox_outline` action=note 添加/清空某章便签。
-- 写该章正文时随本章大纲自动注入【本章灵感便签】；断章续写也拿它当引子。
-- 与 cliffhanger 分工：cliffhanger 是「结尾钩子」（写结尾时用），mood 是「起笔氛围」（开写时用）。
-
-#### 9.8.5 全局卡智能选角（2026-09-13）
-
-- 目标：全局卡不用汐小姐点名，也能自然、有需要地引入故事；但不是一股脑全带，而是经过判断地选。
-- 机制（写在 `_run_write_job` 开头，整章只选一次）：
-  1. `render_global_card_pool(work, ch)` 生成「全局卡池摘要」——每张一行：名字｜身份｜核心特征，
-     并排除本章大纲已出场（已由 render_work_characters 注入）与已有作品卡的角色，避免重复/遮蔽。
-  2. 用 `GLOBAL_CARD_SELECT_PROMPT` 调一次模型选角：给本章大纲 + 用户写作要求 + 卡池摘要，
-     让模型挑「本章真正会出场/被提及/直接影响剧情」的卡。
-  3. 规则：默认一张不选；宁缺毋滥；最多 3 张；已在出场名单的不重复选。
-  4. 选中的卡以完整人设注入 story_context（【本章选用全局人设卡】段），未选中的完全不出现。
-  5. 失败/解析失败/选到不存在的卡：静默降级为空，不阻塞写作。
-- 信息边界联动：人物卡生成与提炼提示词带「信息边界铁律」——只准用用户描述/参考信息/正文里
-  出现的内容，relations 禁止编造故事外人物；audit 复核时整卡扫描关系句式，揪出
-  未出场/未提到人物的关联（`check_card_foreign` 单卡即时自检 + `audit_characters` 全量复核）。
-
-## 10. 模块化拆分（2026-09-21 已完成）
-
-> 背景：原 `core.py`（1719 行，单类 95 方法）与 `main.py`（2098 行）双巨型文件。已将 `core.py` 拆分为 `core/` 包（7 个 Mixin + 门面 + 常量），`main.py` 已于 2026-09-25 按第 12 节拆分出 `handlers/` 包（Mixin 式），**对外行为零变化**：Sandbox 方法名、工具名、目录结构、存档格式一律不变。
-
-### 10.1 实际结构（2026-09-25 现状）
+### 2.1 目录结构（2026-09-25 现状）
 
 ```
 astrbot_plugin_write_sandbox/
-├── main.py                 # 插件类 + @register + 14 个工具注册壳（39 行）
-├── handlers/               # 业务逻辑 Mixin（2026-09-25 拆分，见第 12 节）
-│   ├── __init__.py
-│   ├── base.py             # BaseMixin：基础设施 + PLUGIN_ID
-│   ├── write.py            # WriteMixin：sandbox_write/progress/cancel
-│   ├── outline.py          # OutlineMixin：sandbox_outline
-│   ├── character.py        # CharacterMixin：sandbox_character/extract_characters
-│   ├── learn.py            # LearnMixin：sandbox_learn/favorite
-│   └── misc.py             # MiscMixin：set/status/style_combo/work/cleanup/reset
-├── core/
-│   ├── __init__.py         # 导出 Sandbox（门面）
-│   ├── sandbox.py          # class Sandbox（7 个 Mixin 组合）
-│   ├── constants.py        # 全部常量（目录名/默认配置/维度标签）
-│   ├── storage.py          # 状态读写、history、outputs
-│   ├── style.py            # 风格卡、组合卡、约束
-│   ├── works.py            # 作品工作区、大纲、章节、设定书
-│   ├── characters.py       # 人设卡全套（含字段合并 update）
-│   ├── library.py          # 素材库、收藏
-│   ├── analysis.py         # 重复检测、对话提取、白名单
-│   └── cleanup.py          # 过期文件清理
-├── prompts.py              # 保留不动
+├── main.py            ← 插件入口：@register + 14 个工具注册壳（39 行）
+├── handlers/          ← 业务逻辑 Mixin（2026-09-25 由 main.py 拆分）
+│   ├── base.py        ← BaseMixin：__init__/_get_sandbox/_llm_chat/_clean + PLUGIN_ID
+│   ├── write.py       ← WriteMixin：sandbox_write/progress/cancel 全链路（最肥）
+│   ├── outline.py     ← OutlineMixin：sandbox_outline + _validate_outline + _diff_outline_chapters
+│   ├── character.py   ← CharacterMixin：sandbox_character/extract_characters + 校验
+│   ├── learn.py       ← LearnMixin：sandbox_learn/favorite + _sample_source_text/_pack_sources
+│   └── misc.py        ← MiscMixin：settings/status/style_combo/work/cleanup/reset
+├── core/              ← 沙盒核心包（2026-09-21 由 core.py 拆分）
+│   ├── __init__.py    ← 导出 Sandbox（门面）
+│   ├── sandbox.py     ← class Sandbox（Mixin 组合）
+│   ├── constants.py   ← 常量；DEFAULT_STORY_CONFIG 含三开关
+│   ├── storage.py     ← 状态读写、history、outputs
+│   ├── style.py       ← 风格卡/组合卡/约束（含 work 作品级读写、回退全局）
+│   ├── works.py       ← 作品工作区/大纲/章节/设定书/story_config
+│   ├── characters.py  ← 人设卡全套（含字段合并 update、foreign 检测、audit）
+│   ├── library.py     ← 素材库、收藏
+│   ├── analysis.py    ← 重复检测、对话提取、白名单
+│   └── cleanup.py     ← 过期文件清理
+├── prompts.py         ← 提示词模板 + 三份说明书
 ├── metadata.yaml
-├── PLAN.md
-└── README.md
+└── PLAN.md
 ```
 
-### 10.2 core 拆分映射（Sandbox 95 方法按功能域归位）
+### 2.2 改哪看哪
 
-| 模块 | 归入的方法域 | 估计方法数 |
-|------|-------------|-----------|
-| `constants.py` | 全部模块常量（DEFAULT_*/目录名/维度标签/配置默认值）+ `_safe_title` | 常量 |
-| `storage.py` | `__init__`、`_load_state`、history 读写、output 读写、latest_output_path | ~10 |
-| `style.py` | 风格卡全套（save/list/load/render）、组合卡（combo 相关）、约束（set/render） | ~13 |
-| `works.py` | 作品工作区（active_work/list/work_dir/chapters_dir）、章节摘要、设定书、大纲全套（含 pending）、story_config、接续模式、灵感便签、章节读写、drafts、finalize、render_story_memory | ~45 |
-| `characters.py` | 人设卡全套（字符文件、load/save/delete、update 合并、render、全局卡池、foreign 检测、audit、extract 辅助） | ~20 |
-| `library.py` | library/favorites 文本与来源读取、save_favorite | ~7 |
-| `analysis.py` | collect_whitelist、对话提取、重复词检测 | ~6 |
-| `cleanup.py` | list_stale_files | ~1 |
+| 想改什么 | 去哪个文件 | 验证方式 |
+|---------|-----------|---------|
+| 工具入口/注册 | main.py（壳）+ 对应 handler | syntax_check + load_plugin 重载，日志确认工具注册 |
+| 写作全链路/注入开关/提炼 | handlers/write.py | 冒烟：短篇 generate/continue/revise + 长文开关组合 |
+| 大纲/接续/便签 | handlers/outline.py + core/works.py | 说明书 → save 校验 → confirm 链路走通 |
+| 人设卡 | handlers/character.py + core/characters.py | create→save 校验→view/update/audit 各走一遍 |
+| 风格卡/组合/约束 | core/style.py + handlers/learn.py + misc.py | 学习→状态→组合 set/clear，验证作品回退全局 |
+| 作品工作区/摘要/设定书 | core/works.py | 长文写章→摘要追加→设定书覆盖 |
+| 提示词/说明书 | prompts.py | lint + 生成冒烟 |
 
-拆分实现：每个模块定义对应 **Mixin 类**（如 `StorageMixin`、`StyleMixin`…），`Sandbox` 多重继承组合；对外仍 `from .core import Sandbox`，`main.py` 只改导入路径。
+## 3. 未完成的未来任务
 
-### 10.3 handlers 拆分映射（2026-09-25 已按第 12 节 Mixin 式完成；本表为早期「模块级 handler 函数」方案记录）
+| 任务 | 内容 | 验收标准 |
+|------|------|---------|
+| 素材动态检索（二期） | 素材量大后切块向量化入 knowledge_base，按主题检索 few-shot（原第 5 节方式B） | 素材量触发后风格仍稳定、省 token |
+| 上百章早期弧线归档 | 已完结早期弧线的摘要一次性归档，只归档一次不进循环（原 9.1 扩展点） | 上百章长文上下文不爆，旧弧线信息不丢 |
 
-| 模块 | 承载 | 说明 |
-|------|------|------|
-| `write.py` | `sandbox_write` 全链路 | `_run_write_job`、`_write_section`、`_plan_sections`、`_revise_repeated`、`_notify`、`_select_global_cards`、章节摘要/设定书更新、角色提炼 |
-| `outline.py` | `sandbox_outline` | 大纲 action 分发 |
-| `character.py` | `sandbox_character`、`sandbox_extract_characters` | 人设卡工具 |
-| `learn.py` | `sandbox_learn`、`sandbox_favorite` | 素材学习、收藏 |
-| `misc.py` | progress/cancel/set/status/style_combo/work/cleanup/reset | 其余小工具 |
+## 4. 最近改动小尾巴
 
-实现方式：handlers 以**接收 Sandbox + 事件 + 参数**的模块级函数承载业务，`main.py` 的 llm_tool 方法只做注册壳 + 调用 handler。工具名与方法名不变。
-
-### 10.4 执行顺序与门禁（已完成）
-
-1. ✅ 提交既有修复（人设卡 update），立干净基线（24bdbb6）
-2. ✅ 拆 `core.py` → `core/` 包（constants → storage → style → works → characters → library → analysis → cleanup）
-3. ✅ 拆 `main.py` → `main.py` + `handlers/`（Mixin 式，2026-09-25，见第 12 节，56c205b）
-4. ✅ 每步：`syntax_check` + `load_plugin` 重载冒烟
-5. ✅ 类属性补漏：拆分脚本漏搬 8 个类属性（Assign/AnnAssign 未处理），已全部补回 characters.py 4 个 + analysis.py 4 个；AST 核对 8/8、语法检查通过、插件重载零报错
-6. ✅ 全量验证后 `git commit`（refactor: main.py 拆分 handlers/ 包，56c205b）
-
-### 10.5 风险与对策
-
-- 95 个方法相互调用密集 → 拆分前用 `code_explore` 查调用链，保持 Mixin 内方法可见性
-- `Sandbox` 对外方法名与工具名零改动 → 现有对话用法不受影响
-- 存档/目录结构零改动 → 历史数据不迁移
-- 每模块拆分后立刻重载冒烟 → 问题早暴露早修
-
-## 11. 局部修改能力优化（汐小姐要求，2026-09-21 立项）
-
-> 【汐小姐要求】优化角色卡、大纲与正文的生成/修改逻辑：支持根据要求对**指定内容**进行修改，而非全部推翻重写。
-
-### 11.1 现状调研（2026-09-21 核对）
-
-| 对象 | 当前行为 | 局限 |
-|------|----------|------|
-| 角色卡 update | `apply_character_edit` 纯代码字段合并：正则识别「删除X」「X改为Y」，只动点名字段 | 只认严格写法；自然语言描述（如「性格改得更阴郁」）进「未识别指令」；relations 只能整体清空 |
-| 大纲 revise | 整份大纲 JSON 交模型 + OUTLINE_REVISE_PROMPT 约束「未点名部分原样保留」 | 输出仍为整份大纲，局部性靠提示词约束、无程序保障；章节多时 token 开销大 |
-| 正文 rewrite | 上一段/整章作为上下文，让模型「按新要求重写」 | 整段/整章重写，未点名部分可能被自由改动 |
-
-> 可复用雏形（【昔涟补充】调研发现）：`_revise_repeated`（口水词哨兵修订）＝ LLM 输出**编辑指令** → 程序在正文中**唯一定位**并精确应用，未命中则跳过。这是「指定内容修改」的现成机制底座。
-
-### 11.2 规划方向与实施进度（2026-09-21 实施）
-
-- ✅ **正文局部修订（mode=revise）**：新增 `_revise_text`/`_run_revise`/`_read_target_text`；复用「编辑指令 + 精确应用」底座（抽公共 `_parse_edit_json`/`_apply_edits`，哨兵修订同步重构复用）。用户描述改哪段/哪句/改成什么，LLM 输出带定位的编辑指令（替换/删除/插入），程序 `count==1` 唯一定位精确应用，未点名内容不动；改动摘要用 difflib 展示。
-- ✅ **角色卡 / 大纲改「说明书模式」（汐小姐追加要求）**：工具不再黑盒生成，而是返回行动指南（`CHARACTER_GUIDE`/`OUTLINE_GUIDE`/`OUTLINE_REVISE_GUIDE`），由主模型照格式框架亲手编写，工具用 `action=save` 收单。收单走纯代码校验器（`_validate_character_card`/`_validate_outline`）与差异审查（`_diff_outline_chapters`，对未点名章节做程序级保障），不合格打回。角色卡 update 保持纯代码字段合并，识别不了时返回 `_build_card_update_guide` 字段编辑说明书。
-- 开发顺序：先正文 → 再角色卡/大纲说明书模式；每步 `syntax_check` + `lint_runner` + `load_plugin` 重载冒烟 + 校验器逻辑验证。
-
-### 11.3 实施记录（2026-09-21 已完成）
-
-- ✅ 正文 revise：`sandbox_write` 新增 `mode=revise` 同步分支，读取最近产出/指定章/草稿 → LLM 编辑指令 → 精确应用 → 覆盖落盘 + 改动摘要。
-- ✅ 大纲说明书：`sandbox_outline` write/revise 改为返回说明书；新增 `action=save`（text 传 JSON）→ `_validate_outline` 结构校验 + `_diff_outline_chapters` 差异审查 → `save_pending_outline`。
-- ✅ 角色卡说明书：`sandbox_character` create 改为返回 `CHARACTER_GUIDE`；新增 `action=save`（text 传 JSON）→ `_validate_character_card` 校验 → `save_character`；update 未识别时返回字段编辑说明书。
-- ✅ 提示词：prompts.py 新增 `CHARACTER_GUIDE`/`OUTLINE_GUIDE`/`OUTLINE_REVISE_GUIDE` + build 函数；黑盒版 `build_outline_prompt`/`build_outline_revise_prompt` 已不再被 main.py 调用（定义保留）。
-- ✅ 验证：main.py/prompts.py `lint_runner` 0 问题；`load_plugin` 重载成功；校验器 7 组用例全过（合法通过/缺 name 打回/类型打回/连续通过/跳号重复空打回/diff 增删改识别）。
-
-## 12. main.py handlers 拆分（Mixin 式，2026-09-25 定稿）
-
-> 【汐小姐要求】按方案拆分 main.py（2098 行 / 103.7KB / 47 方法 / 14 工具）→ handlers/ 包。
-> 评估结论（【昔涟评估】）：方法间调用为树状/星状、无跨域环；write 域内部高内聚，其余域只共用
-> `_get_sandbox/_llm_chat/_clean` 等基础设施 → 可拆。
-> 采用 **Mixin 式**（与 core.py 拆分同套打法），放弃 10.3 早期规划的「模块级 handler 函数」——
-> Mixin 保留 self 语义、不改 llm_tool 注册方式、不动任何签名，风险最低。
-
-### 12.1 目标结构
-
-```
-main.py（实际 39 行）      ← @register + 类声明 + 基础设施引用 + 14 个注册壳
-handlers/
-├── __init__.py           ← 空，仅标记包
-├── base.py     BaseMixin       ← 基础设施：__init__/_get_sandbox/_llm_chat/_clean/_last_assistant_output/_build_continue_context/_apply_banned_words + PLUGIN_ID
-├── write.py    WriteMixin      ← 最肥：sandbox_write/sandbox_progress/sandbox_cancel + 24 个辅助（_run_write_job/_write_section/_notify/_plan_sections/_select_global_cards/_ensure_section_length/_strip_story_mark/_check_story_ended/_parse_* /revise 全家/_parse_edit_json/_apply_edits/_revise_repeated/_ctx/_read_target_text/_revise_text/_run_revise/_chapter_summary/_update_story_state/_extract_characters/_auto_extract_characters）
-├── outline.py  OutlineMixin    ← sandbox_outline + _validate_outline + _diff_outline_chapters
-├── character.py CharacterMixin ← sandbox_character/sandbox_extract_characters + _validate_character_card/_build_card_update_guide
-├── learn.py    LearnMixin      ← sandbox_learn/sandbox_favorite + _sample_source_text/_pack_sources
-└── misc.py     MiscMixin       ← sandbox_set/sandbox_status/sandbox_style_combo/sandbox_work/sandbox_cleanup/sandbox_reset
-```
-
-### 12.2 继承与依赖
-
-- `class WriteSandboxPlugin(BaseMixin, WriteMixin, OutlineMixin, CharacterMixin, LearnMixin, MiscMixin, Star)`，`@register` 装饰最终类留在 main.py。
-- 依赖单向无环：handlers 各自 import `core`/`prompts`/`filter`，main 只 import handlers；Mixin 之间互不 import，靠 self 共享（跨域调用如 `sandbox_extract_characters → _extract_characters` 经 MRO 天然可用）。
-- `PLUGIN_ID` 挪到 handlers/base.py，main.py 从 base 引用，避免循环导入。
-- 模块级函数 `_sample_source_text/_pack_sources` 随 learn 域迁入 learn.py。
-
-### 12.3 执行步骤（2026-09-25 全部完成）
-
-1. ✅ 建 handlers/ 包 + base.py（基础设施 Mixin：__init__/6 方法 + _sample_source_text/_pack_sources 共享工具函数 + PLUGIN_ID）
-2. ✅ write.py（最肥 25 方法，含 3 个工具装饰器；拆完语法+lint 双绿）
-3. ✅ outline.py（3 方法）+ character.py（4 方法，补 import base._pack_sources）
-4. ✅ learn.py（2 方法）+ misc.py（6 方法）
-5. ✅ 改 main.py：2098 行 → 39 行注册壳；`class WriteSandboxPlugin(BaseMixin, WriteMixin, OutlineMixin, CharacterMixin, LearnMixin, MiscMixin, Star)`；@register 与 PLUGIN_ID 保留
-6. ✅ 全量验证：符号核验 47/47（无漏无多、装饰器一致）；py_compile 20 文件全过；ruff 0 问题；load_plugin 重载成功，日志确认 14 个 llm_tool 全部注册、零报错
-7. ✅ git commit（refactor: main.py 拆分 handlers/ 包，56c205b）
-8. ✅ 本文件更新标记完成
-
-> 拆分坑位记录（【昔涟补充】）：① ast.get_source_segment 从方法行开始，会切掉装饰器行 → 起点改用 decorator_list 最早 lineno；② 类属性（_CN_DIGITS/_CN_UNITS）不会随方法搬走，需单独提取 → 已随 write 域搬入 WriteMixin；③ 方法内硬编码 `WriteSandboxPlugin._xxx` 需替换为所属 Mixin 名 → 已清零。
-
-### 12.4 风险与对策
-
-- **AST 漏搬**：上次 core.py 拆分漏过 8 个类属性 → 脚本覆盖 Assign/AnnAssign，搬完对照 AST 核验符号齐全
-- **循环导入**：已规避（main→handlers 单向）
-- **装饰器**：`@filter.llm_tool` 随方法搬走，handlers 各自 import filter
-- **回滚**：git 基线 70aab3f 已就位，每步 safe_edit 自动备份，出问题随时回退
-
-## 13. 风格卡作品级绑定 + 注入/提炼可选项（汐小姐要求，2026-09-25 立项）
-
-> 【汐小姐要求】① 风格卡跟作品绑定，不是只有默认一张卡——新作品重新调卡，不会调了之后所有写作都用同一张卡；
-> ② 注入先前章节摘要、提取人设卡等作为可选项——之前单元剧写法错误地一直注入无关章节内容当干扰；
-> ③ 角色卡提取太灵敏，卡越积越多却基本用一次就丢，要收紧。
-
-### 13.1 现状（2026-09-25 核对）
-
-| 项 | 当前行为 | 问题 |
-|----|----------|------|
-| 风格卡 | 全局一份 `style_card.json` 主卡 + `style_cards/` 库存 + `style_combo.json` 组合，所有作品共用 | 调一张卡全部作品跟着变，没有作品隔离 |
-| 摘要/设定书注入 | 写正文时（work 模式）无条件 `render_story_memory`（摘要+设定书）+ `render_chapter_outline` + `render_work_characters`（出场角色卡）+ 全局卡选角 | 单元剧每集独立，仍被前面章节摘要/角色干扰 |
-| 角色卡自动提炼 | 每章写完无条件 `_auto_extract_characters`（confidence≥0.6 且 mention_count≥3 建卡） | 一次性龙套也建卡，越积越多、用一次就丢 |
-
-### 13.2 设计（2026-09-25 定稿）
-
-**A. 风格卡作品级绑定**
-- 作品目录 `stories/《作品名>/` 下新增作品级三件套：`style_card.json`（作品主卡）、`style_cards/`（作品卡库）、`style_combo.json`（作品组合）。
-- 读取优先级：当前激活作品时 → 优先作品级卡；作品无卡/未学习 → 回退全局卡；无激活作品 → 全局卡。
-- `sandbox_learn`：有激活作品 → 学进作品卡库 + 设为作品主卡；无 → 存全局卡库 + 全局主卡。
-- `sandbox_style_combo`：按当前激活作品隔离存读（set/list/inspect/clear 均走作品级或全局）。
-- 核心改动在 `core/style.py`：`list_style_cards/load_style_card_by_name/set_combo/clear_combo/get_combo/combo_status/render_combo_card/render_style_card` 全部增加可选 `work` 参数（默认 None=全局），作品路径由 `core/works.py` 提供（`style_card_path(work)/style_cards_dir(work)/combo_file(work)`）。
-
-**B. 注入/提炼可选项（作品级 story_config 开关）**
-- `DEFAULT_STORY_CONFIG` 增加三个布尔开关（默认值见下）：
-  - `inject_memory`（默认 true）：是否注入「摘要流水 + 设定书」（render_story_memory）
-  - `inject_characters`（默认 true）：是否注入「本章出场人设卡 + 全局卡选角」
-  - `auto_extract`（默认 **false**）：每章写完是否自动提炼人设卡（收紧为默认关）
-- 单元剧/独立短篇可把 `inject_memory`、`inject_characters` 关掉，只留本章大纲 + 当前指令，杜绝无关章节串扰。
-- 配置入口：`sandbox_work` 新增 `action=config`（key/value/name），如 `沙盒作品(action=config, name=作品名, key=inject_memory, value=false)`。
-- `handlers/write.py` 的 `_run_write_job`：按 `load_story_config(work)` 判断是否注入 memory / characters / 全局卡选角；写完按 `auto_extract` 决定是否调用 `_auto_extract_characters`。
-
-**C. 角色卡提取收紧**
-- 自动提炼默认关闭（`auto_extract=false`）；开启时仍按原阈值，但只在**本章 + 多章累计出现**的角色里建卡——单章一次性龙套不建。
-- 手动 `sandbox_extract_characters` 保留（明确动作），默认阈值从 0.45/2 次收紧到 0.6/3 次，与自动一致；建卡结果里明确标注「新建 / 已有跳过 / 龙套未建」。
-- 目标：卡库只留真正反复出现的角色，一次性人物进设定书/正文即可。
-
-### 13.3 实施步骤（2026-09-25 已完成 ✅，全部验证通过）
-
-1. `core/constants.py`：`DEFAULT_STORY_CONFIG` 加 `inject_memory/inject_characters/auto_extract` 三开关
-2. `core/works.py`：新增作品级风格卡路径访问（style_card_path/style_cards_dir/combo_file）+ `set_story_config_value(work, key, value)` 配置写入
-3. `core/style.py`：全部卡方法加 `work` 参数与作品级读写（回退全局）
-4. `handlers/learn.py`：学习按激活作品落库 + 设作品主卡
-5. `handlers/misc.py`：`sandbox_style_combo` 按激活作品隔离；`sandbox_work` 加 action=config
-6. `handlers/write.py`：`_run_write_job` 按开关注入 + 按 auto_extract 决定自动提炼；`_auto_extract_characters` 支持多章累计统计
-7. `handlers/character.py`：手动提取阈值收紧到 0.6/3，结果标注分类
-8. 验证：每步 syntax_check + lint_runner + load_plugin 重载冒烟；全量验证后 git commit
-9. 更新本文件标记完成
-
-### 13.4 风险与对策
-
-- **改方法签名**：style 域方法加 `work` 参数后，旧调用（learn.py/misc.py/write.py 无 work 调用）必须兼容默认 None=全局 → 逐个调用点核对
-- **作品路径不存在**：作品切换才建目录，卡方法里对不存在的作品目录直接回退全局
-- **老作品无卡**：回退全局卡，行为与现状一致，不破坏既有写作
-- **回滚**：git 基线 70aab3f 已就位，每步 safe_edit 自动备份
+1. 2026-09-25 风格卡作品级绑定 + 注入/提炼三开关（inject_memory/inject_characters/auto_extract）+ 角色卡提取收紧 0.6/3
+2. 2026-09-25 main.py → handlers/ 包拆分（Mixin 式，56c205b）
+3. 2026-09-21 局部修改优化：正文 mode=revise + 角色卡/大纲说明书模式
+4. 2026-09-21 core.py → core/ 包拆分（Mixin 式）
+5. 2026-09-13 写作体验小部件：章节接续 / 废稿清理 / 口水词哨兵 / 灵感便签
