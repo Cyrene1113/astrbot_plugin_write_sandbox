@@ -180,20 +180,21 @@ class CharacterMixin:
         text: str = "",
         scope: str = "work",
         work: str = "",
-        min_confidence: str = "0.45",
+        min_confidence: str = "0.6",
     ) -> str:
         """从文本/素材/作品章节中统计角色戏份，出现次数与置信度达标的自动提炼成人设卡并保存。
 
         当用户说「把这几章的角色提成人设卡」「从这段文字里提取角色」「给戏份多的角色建卡」时调用。
-        判断机制：模型评估每个角色的出现次数/涉及段落/置信度，confidence≥阈值（默认0.45）且
-        出现≥2次才建卡；已有同名卡不会覆盖，避免破坏手工卡。
+        判断机制：模型评估每个角色的出现次数/涉及段落/置信度，confidence≥阈值（默认0.6）且
+        出现≥3次才建卡，单章一次性龙套不建；已有同名卡不会覆盖，避免破坏手工卡。
+        结果会标明：新建 / 已有跳过 / 龙套未建。
 
         Args:
             source(string): recent=最近产出（默认）；library=素材库全部；work=当前作品全部章节；manual=手动传 text。
             text(string): source=manual 时必填，要分析的原文。
             scope(string): global=存全局；work=存当前作品（默认）。
             work(string): 可选，scope=work 时指定作品。
-            min_confidence(string): 提卡最低置信度 0~1，默认 0.45。
+            min_confidence(string): 提卡最低置信度 0~1，默认 0.6。
         """
         sandbox = self._get_sandbox(event)
         if not sandbox:
@@ -246,10 +247,20 @@ class CharacterMixin:
 
         passed = [
             c for c in chars
-            if c.get("confidence", 0) >= threshold and c.get("mention_count", 0) >= 2
+            if c.get("confidence", 0) >= threshold and c.get("mention_count", 0) >= 3
+        ]
+        # 龙套未建：有戏份但未达提卡门槛（出现不足 3 次或置信不足）的角色，只报不建
+        passed_names = {str(c.get("name") or "").strip() for c in passed}
+        weak = [
+            str(c.get("name") or "").strip()
+            for c in chars
+            if str(c.get("name") or "").strip()
+            and str(c.get("name") or "").strip() not in passed_names
+            and (c.get("mention_count", 0) or 0) > 0
         ]
         if not passed:
-            return "这一段里没有明显够格的角色（出现次数/置信度不足），换更长的正文再试试？"
+            tail = f"（另有 {len(weak)} 个一次性龙套未建卡：{'、'.join(weak[:8])}{'…' if len(weak) > 8 else ''}）" if weak else ""
+            return "这一段里没有够格立卡的角色（出现≥3次且置信度≥0.6 才建）。" + tail
 
         reference = sandbox.render_story_memory(active)[:1500] if active else ""
         created: list[str] = []
@@ -297,6 +308,8 @@ class CharacterMixin:
         lines.append("新建人设卡：" + ("、".join(created) if created else "（无）"))
         if skipped:
             lines.append("跳过（已有卡或失败）：" + "、".join(skipped))
+        if weak:
+            lines.append("龙套未建（出现不足/置信不足）：" + "、".join(weak[:10]) + ("…" if len(weak) > 10 else ""))
         if suspect_cards:
             lines.append("⚠️ 以下新卡疑似夹带名单外人物关联（未出场/未提到）：" + "；".join(suspect_cards))
         lines.append("卡库现有：" + ("、".join(sandbox.list_characters(active)) or "（空）"))

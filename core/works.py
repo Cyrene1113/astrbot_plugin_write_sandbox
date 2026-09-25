@@ -24,6 +24,8 @@ class WorksMixin:
             self.active_work_file.write_text(
                 json.dumps({"work": work}, ensure_ascii=False), encoding="utf-8"
             )
+        # 切换作品后刷新风格作用域：作品有自己的卡则用作品，否则回退全局
+        self._refresh_style_scope(work)
         return work
 
     def clear_active_work(self) -> None:
@@ -32,6 +34,7 @@ class WorksMixin:
             self.active_work_file.write_text(
                 json.dumps({"work": ""}, ensure_ascii=False), encoding="utf-8"
             )
+        self._refresh_style_scope()
 
     def list_works(self) -> list[str]:
         if not self.stories_dir.exists():

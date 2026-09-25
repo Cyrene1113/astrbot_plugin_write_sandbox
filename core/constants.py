@@ -67,6 +67,11 @@ STORY_CONFIG_FILE = "story_config.json"
 
 DEFAULT_STORY_CONFIG: dict[str, Any] = {
     "chapter_link": "auto",  # auto 自动 / continuous 连续叙事 / break 断章收尾
+    # 写正文时的记忆注入开关（单元剧/独立短篇可关掉，避免被无关章节串扰）
+    "inject_memory": True,  # 是否注入「前文摘要 + 设定书」
+    "inject_characters": True,  # 是否注入「本章出场人设卡 + 全局卡选角」
+    # 每章写完是否自动提炼人设卡（默认关：只给多章累计反复出现的角色建卡）
+    "auto_extract": False,
 }
 
 DEFAULT_STORY_STATE: dict[str, Any] = {

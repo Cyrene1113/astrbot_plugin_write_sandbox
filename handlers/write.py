@@ -266,15 +266,21 @@ class WriteMixin:
             total = self._plan_sections(job)
             job["section_total"] = total
             job["status"] = "running"
-            story_context = sandbox.render_story_memory(work) if work else ""
+            # 作品级注入开关：inject_memory=摘要+设定书，inject_characters=人设卡+选角
+            # 单元剧/独立短篇可关掉两者，只留本章大纲 + 用户指令，避免被无关章节串扰
+            cfg = sandbox.load_story_config(work) if work else {}
+            inject_memory = bool(cfg.get("inject_memory", True)) if work else True
+            inject_chars = bool(cfg.get("inject_characters", True)) if work else True
+            story_context = sandbox.render_story_memory(work) if (work and inject_memory) else ""
             chapter_outline = sandbox.render_chapter_outline(work, ch) if work else ""
             if chapter_outline:
                 story_context = (story_context + "\n\n" + chapter_outline) if story_context else chapter_outline
-            work_chars = sandbox.render_work_characters(work, ch) if work else ""
-            if work_chars:
-                story_context = (story_context + "\n\n" + work_chars) if story_context else work_chars
+            if work and inject_chars:
+                work_chars = sandbox.render_work_characters(work, ch) if work else ""
+                if work_chars:
+                    story_context = (story_context + "\n\n" + work_chars) if story_context else work_chars
             # 全局卡智能选角：按本章剧情需要自动挑选，不点名、不全带
-            if work:
+            if work and inject_chars:
                 try:
                     picked = await self._select_global_cards(sandbox, work, ch, instruction, chapter_outline)
                     if picked:
@@ -332,13 +338,15 @@ class WriteMixin:
                     summary = full[:200]
                 sandbox.upsert_chapter_summary(work, final_ch, summary)
                 await self._update_story_state(sandbox, work, full, final_ch)
-                # 自动提炼人设卡：按出现次数/置信度判断，达标且无同名卡才建卡
-                try:
-                    created = await self._auto_extract_characters(sandbox, work, full)
-                    if created:
-                        job["extract_report"] = "、".join(created)
-                except Exception as e:
-                    logger.warning(f"自动提炼人设卡失败: {e}")
+                # 自动提炼人设卡：受作品级 auto_extract 开关控制（默认关）
+                # 开启后只给「多章累计反复出现」的角色建卡，单章一次性龙套跳过
+                if sandbox.load_story_config(work).get("auto_extract", False):
+                    try:
+                        created = await self._auto_extract_characters(sandbox, work, full)
+                        if created:
+                            job["extract_report"] = "、".join(created)
+                    except Exception as e:
+                        logger.warning(f"自动提炼人设卡失败: {e}")
 
             job["status"] = "done"
             # 口水词小哨兵：整章/整段完成后自动扫一遍重复词，随通知附上；
@@ -455,7 +463,7 @@ class WriteMixin:
             )
 
         system_prompt = build_system_prompt(
-            style_card=sandbox.render_style_card(),
+            style_card=sandbox.render_style_card(work=work),
             constraints=constraints_text,
             history=history_text,
             instruction=instruction,
@@ -948,7 +956,15 @@ class WriteMixin:
         return chars
 
     async def _auto_extract_characters(self, sandbox: Sandbox, work: str, full_text: str) -> list[str]:
-        """整章写完后的自动提炼：置信度达标且无同名卡才建卡，返回新建卡名列表。"""
+        """整章写完后的自动提炼（作品级开关 auto_extract=True 时才调用）。
+
+        收紧规则：
+        - 只给「多章累计反复出现」的角色建卡：名字至少出现在 2 个不同章节文件里，
+          且本章出现次数 >= 3、置信度 >= 0.6；
+        - 单章一次性龙套直接跳过，不建卡；
+        - 已有卡（含别名）不重复建。
+        返回新建卡名列表。
+        """
         try:
             chars = await self._extract_characters(full_text)
         except Exception as e:
@@ -959,6 +975,9 @@ class WriteMixin:
         for c in chars:
             nm = str(c.get("name") or "").strip()
             if not nm or c.get("confidence", 0) < 0.6 or c.get("mention_count", 0) < 3:
+                continue
+            # 跨章累计判定：名字必须出现在至少 2 个不同章节文件（单章龙套跳过）
+            if sandbox.count_chapter_mentions(work, nm) < 2:
                 continue
             if sandbox.load_character(nm, work):
                 continue

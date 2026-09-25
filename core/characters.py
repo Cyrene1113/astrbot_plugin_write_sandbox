@@ -325,6 +325,28 @@ class CharactersMixin:
             return False
         return True
 
+    def count_chapter_mentions(self, work: str, name: str) -> int:
+        """统计角色名出现在多少个不同章节文件里（跨章累计判定）。
+
+        名字或别名任一出现在某章文件即计 1 章；用于「多章反复出现才建卡」的收紧规则。
+        无章节文件返回 0。
+        """
+        name = (name or "").strip()
+        if not name or not work:
+            return 0
+        d = self.chapters_dir(work)
+        if not d.exists():
+            return 0
+        hits = 0
+        for p in sorted(d.glob("*.txt")):
+            try:
+                text = p.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            if name in text:
+                hits += 1
+        return hits
+
     def _work_body_text(self, work: str, max_chars: int = 200000) -> str:
         """拼接作品全部章节正文（截断上限），用于「正文是否出现过该角色」的判定。"""
         parts: list[str] = []

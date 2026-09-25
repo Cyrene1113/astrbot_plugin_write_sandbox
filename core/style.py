@@ -11,18 +11,26 @@ from .constants import CORE_DIMS, CORE_LABELS, _LOCK
 class StyleMixin:
     """style 域方法。"""
 
-    def list_style_cards(self) -> list[str]:
-        """列出 style_cards/ 目录下所有可点名的风格卡。"""
-        if not self.style_cards_dir.exists():
-            return []
-        return sorted(p.stem for p in self.style_cards_dir.glob("*.json"))
+    def list_style_cards(self, work: str = "") -> list[str]:
+        """列出当前作用域 style_cards/ 目录下所有可点名的风格卡。
 
-    def load_style_card_by_name(self, name: str) -> Optional[dict]:
-        """按卡名（不带 .json）加载一张风格卡，找不到返回 None。"""
+        work 传入时按该作品作用域解析（作品有自己的卡库则列作品，否则回退全局）。
+        """
+        _, cards_dir, _ = self._style_scope_files(work)
+        if not cards_dir.exists():
+            return []
+        return sorted(p.stem for p in cards_dir.glob("*.json"))
+
+    def load_style_card_by_name(self, name: str, work: str = "") -> Optional[dict]:
+        """按卡名（不带 .json）加载一张风格卡，找不到返回 None。
+
+        work 传入时按该作品作用域解析卡库。
+        """
         name = name.strip()
         if not name:
             return None
-        candidates = [p for p in self.style_cards_dir.glob("*.json") if p.stem == name]
+        _, cards_dir, _ = self._style_scope_files(work)
+        candidates = [p for p in cards_dir.glob("*.json") if p.stem == name]
         if not candidates:
             return None
         try:
@@ -34,7 +42,10 @@ class StyleMixin:
         return None
 
     def set_combo(self, cards: list[str], dims: Optional[dict[str, list[str]]] = None) -> tuple[bool, str]:
-        """设置风格组合：cards 为参与融合的底卡列表；dims 为维度级来源指定。"""
+        """设置风格组合：cards 为参与融合的底卡列表；dims 为维度级来源指定。
+
+        作品激活时组合写入作品自己的 style_combo.json（作品独立组合），否则写全局。
+        """
         dims = dims or {}
         available = self.list_style_cards()
         avail_set = set(available)
@@ -55,20 +66,26 @@ class StyleMixin:
             if vs:
                 clean_dims[k] = vs
         self.combo = {"cards": clean_cards, "dims": clean_dims}
+        _, _, combo_file = self._write_style_scope()
+        combo_file.parent.mkdir(parents=True, exist_ok=True)
         with _LOCK:
-            self.combo_file.write_text(
+            combo_file.write_text(
                 json.dumps(self.combo, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+        self._refresh_style_scope()
         return True, "风格组合已保存。"
 
     def clear_combo(self) -> None:
         self.combo = {"cards": [], "dims": {}}
+        _, _, combo_file = self._write_style_scope()
+        combo_file.parent.mkdir(parents=True, exist_ok=True)
         with _LOCK:
-            self.combo_file.write_text(
+            combo_file.write_text(
                 json.dumps(self.combo, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+        self._refresh_style_scope()
 
     def get_combo(self) -> dict[str, Any]:
         return self.combo
@@ -87,16 +104,52 @@ class StyleMixin:
             lines.append("  全部维度：融合所有底卡（冲突维度请在 dims 中指定单卡来源）")
         return "\n".join(lines)
 
-    def render_combo_card(self) -> str:
-        """组合渲染：每个维度列出其来源卡的笔法（默认全部底卡融合，dims 覆盖），供模型自行融合。"""
-        combo = self.combo
+    def _scope_style_card(self, work: str = "") -> dict:
+        """按作用域读取主卡（作品有自己主卡读作品，否则全局）；读不到返回默认卡。"""
+        card_file, _, _ = self._style_scope_files(work)
+        if card_file.exists():
+            try:
+                data = json.loads(card_file.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                pass
+        return dict(DEFAULT_STYLE_CARD)
+
+    def _scope_combo(self, work: str = "") -> dict[str, Any]:
+        """按作用域读取组合配置（作品有自己组合读作品，否则全局）；读不到返回空组合。"""
+        _, _, combo_file = self._style_scope_files(work)
+        if combo_file.exists():
+            try:
+                data = json.loads(combo_file.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    cards = [str(c) for c in (data.get("cards") or []) if str(c)]
+                    dims_raw = data.get("dims") or {}
+                    dims: dict[str, list[str]] = {}
+                    if isinstance(dims_raw, dict):
+                        for k, v in dims_raw.items():
+                            if isinstance(v, list):
+                                dims[str(k)] = [str(x) for x in v if str(x)]
+                            elif v:
+                                dims[str(k)] = [str(v)]
+                    return {"cards": cards, "dims": dims}
+            except Exception:
+                pass
+        return {"cards": [], "dims": {}}
+
+    def render_combo_card(self, work: str = "") -> str:
+        """组合渲染：每个维度列出其来源卡的笔法（默认全部底卡融合，dims 覆盖），供模型自行融合。
+
+        work 传入时按该作品作用域解析卡库与组合（后台写作按任务作品取风格）。
+        """
+        combo = self._scope_combo(work)
         cards = combo.get("cards") or []
         dims = combo.get("dims") or {}
         if not cards:
             return "（未启用组合，使用主卡风格）"
         loaded: dict[str, dict] = {}
         for c in cards:
-            card = self.load_style_card_by_name(c)
+            card = self.load_style_card_by_name(c, work)
             if card is not None:
                 loaded[c] = card
         if not loaded:
@@ -140,10 +193,10 @@ class StyleMixin:
                         lines.append(f"  〔{c}〕{e.get('tag', '')}: {str(e.get('text', ''))[:60]}")
         return "\n".join(lines)
 
-    def render_style_card(self) -> str:
-        if self.combo.get("cards"):
-            return self.render_combo_card()
-        card = self.style_card
+    def render_style_card(self, work: str = "") -> str:
+        if self._scope_combo(work).get("cards"):
+            return self.render_combo_card(work)
+        card = self._scope_style_card(work)
         if not card:
             return "（尚未学习风格，使用默认风格）"
         core = card.get("core") if isinstance(card.get("core"), dict) else {}

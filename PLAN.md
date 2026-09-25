@@ -112,7 +112,15 @@ style_card.json
 astrbot_plugin_write_sandbox/
 ├── PLAN.md            ← 本文件（方案基准）
 ├── metadata.yaml
-├── main.py            ← 插件入口 + llm_tool 注册 + 执行逻辑（handlers 拆分暂缓）
+├── main.py            ← 插件入口 + llm_tool 注册 + 14 个注册壳（39 行，2026-09-25 拆分）
+├── handlers/          ← 业务逻辑 Mixin（2026-09-25 由 main.py 拆分，见第 12 节）
+│   ├── __init__.py
+│   ├── base.py        ← BaseMixin 基础设施 + PLUGIN_ID
+│   ├── write.py       ← WriteMixin：sandbox_write/progress/cancel 全链路
+│   ├── outline.py     ← OutlineMixin：sandbox_outline
+│   ├── character.py   ← CharacterMixin：sandbox_character/extract_characters
+│   ├── learn.py       ← LearnMixin：sandbox_learn/favorite
+│   └── misc.py        ← MiscMixin：set/status/style_combo/work/cleanup/reset
 ├── core/              ← 沙盒核心包（2026-09-21 由 core.py 拆分）
 │   ├── __init__.py    ← 导出 Sandbox（门面）
 │   ├── sandbox.py     ← class Sandbox（7 个 Mixin 组合）
@@ -345,13 +353,21 @@ stories/
 
 ## 10. 模块化拆分（2026-09-21 已完成）
 
-> 背景：原 `core.py`（1719 行，单类 95 方法）与 `main.py`（1832 行）双巨型文件。已将 `core.py` 拆分为 `core/` 包（7 个 Mixin + 门面 + 常量），**对外行为零变化**：Sandbox 方法名、工具名、目录结构、存档格式一律不变。`main.py` 的 handlers 拆分暂缓。
+> 背景：原 `core.py`（1719 行，单类 95 方法）与 `main.py`（2098 行）双巨型文件。已将 `core.py` 拆分为 `core/` 包（7 个 Mixin + 门面 + 常量），`main.py` 已于 2026-09-25 按第 12 节拆分出 `handlers/` 包（Mixin 式），**对外行为零变化**：Sandbox 方法名、工具名、目录结构、存档格式一律不变。
 
-### 10.1 实际结构（2026-09-21 现状）
+### 10.1 实际结构（2026-09-25 现状）
 
 ```
 astrbot_plugin_write_sandbox/
-├── main.py                 # 插件类 + 14 个工具注册 + 执行逻辑（handlers 拆分暂缓）
+├── main.py                 # 插件类 + @register + 14 个工具注册壳（39 行）
+├── handlers/               # 业务逻辑 Mixin（2026-09-25 拆分，见第 12 节）
+│   ├── __init__.py
+│   ├── base.py             # BaseMixin：基础设施 + PLUGIN_ID
+│   ├── write.py            # WriteMixin：sandbox_write/progress/cancel
+│   ├── outline.py          # OutlineMixin：sandbox_outline
+│   ├── character.py        # CharacterMixin：sandbox_character/extract_characters
+│   ├── learn.py            # LearnMixin：sandbox_learn/favorite
+│   └── misc.py             # MiscMixin：set/status/style_combo/work/cleanup/reset
 ├── core/
 │   ├── __init__.py         # 导出 Sandbox（门面）
 │   ├── sandbox.py          # class Sandbox（7 个 Mixin 组合）
@@ -384,7 +400,7 @@ astrbot_plugin_write_sandbox/
 
 拆分实现：每个模块定义对应 **Mixin 类**（如 `StorageMixin`、`StyleMixin`…），`Sandbox` 多重继承组合；对外仍 `from .core import Sandbox`，`main.py` 只改导入路径。
 
-### 10.3 handlers 拆分映射（暂缓执行，保留规划）
+### 10.3 handlers 拆分映射（2026-09-25 已按第 12 节 Mixin 式完成；本表为早期「模块级 handler 函数」方案记录）
 
 | 模块 | 承载 | 说明 |
 |------|------|------|
@@ -400,10 +416,10 @@ astrbot_plugin_write_sandbox/
 
 1. ✅ 提交既有修复（人设卡 update），立干净基线（24bdbb6）
 2. ✅ 拆 `core.py` → `core/` 包（constants → storage → style → works → characters → library → analysis → cleanup）
-3. ⬜ 拆 `main.py` → `main.py` + `handlers/`（暂缓：main.py 功能正常，后续按需再拆）
+3. ✅ 拆 `main.py` → `main.py` + `handlers/`（Mixin 式，2026-09-25，见第 12 节，56c205b）
 4. ✅ 每步：`syntax_check` + `load_plugin` 重载冒烟
 5. ✅ 类属性补漏：拆分脚本漏搬 8 个类属性（Assign/AnnAssign 未处理），已全部补回 characters.py 4 个 + analysis.py 4 个；AST 核对 8/8、语法检查通过、插件重载零报错
-6. ⬜ 全量验证后 `git commit`（refactor: 消息）
+6. ✅ 全量验证后 `git commit`（refactor: main.py 拆分 handlers/ 包，56c205b）
 
 ### 10.5 风险与对策
 
@@ -451,7 +467,7 @@ astrbot_plugin_write_sandbox/
 ### 12.1 目标结构
 
 ```
-main.py（→约250行）      ← @register + 类声明 + 基础设施引用 + 14 个注册壳
+main.py（实际 39 行）      ← @register + 类声明 + 基础设施引用 + 14 个注册壳
 handlers/
 ├── __init__.py           ← 空，仅标记包
 ├── base.py     BaseMixin       ← 基础设施：__init__/_get_sandbox/_llm_chat/_clean/_last_assistant_output/_build_continue_context/_apply_banned_words + PLUGIN_ID
@@ -469,16 +485,18 @@ handlers/
 - `PLUGIN_ID` 挪到 handlers/base.py，main.py 从 base 引用，避免循环导入。
 - 模块级函数 `_sample_source_text/_pack_sources` 随 learn 域迁入 learn.py。
 
-### 12.3 执行步骤
+### 12.3 执行步骤（2026-09-25 全部完成）
 
-1. 建 handlers/ 包 + base.py（基础设施 Mixin）
-2. write.py（最肥，拆完立刻重载冒烟）
-3. outline.py + character.py
-4. learn.py + misc.py
-5. 改 main.py：删已搬方法（AST 按 end_lineno 精确切，防漏搬多搬）、改继承、改 import
-6. 全量验证：py_compile 全部 + lint 0 问题 + load_plugin 重载 + 实调一次沙盒工具冒烟
-7. git commit（refactor: 消息）
-8. 更新本文件标记完成
+1. ✅ 建 handlers/ 包 + base.py（基础设施 Mixin：__init__/6 方法 + _sample_source_text/_pack_sources 共享工具函数 + PLUGIN_ID）
+2. ✅ write.py（最肥 25 方法，含 3 个工具装饰器；拆完语法+lint 双绿）
+3. ✅ outline.py（3 方法）+ character.py（4 方法，补 import base._pack_sources）
+4. ✅ learn.py（2 方法）+ misc.py（6 方法）
+5. ✅ 改 main.py：2098 行 → 39 行注册壳；`class WriteSandboxPlugin(BaseMixin, WriteMixin, OutlineMixin, CharacterMixin, LearnMixin, MiscMixin, Star)`；@register 与 PLUGIN_ID 保留
+6. ✅ 全量验证：符号核验 47/47（无漏无多、装饰器一致）；py_compile 20 文件全过；ruff 0 问题；load_plugin 重载成功，日志确认 14 个 llm_tool 全部注册、零报错
+7. ✅ git commit（refactor: main.py 拆分 handlers/ 包，56c205b）
+8. ✅ 本文件更新标记完成
+
+> 拆分坑位记录（【昔涟补充】）：① ast.get_source_segment 从方法行开始，会切掉装饰器行 → 起点改用 decorator_list 最早 lineno；② 类属性（_CN_DIGITS/_CN_UNITS）不会随方法搬走，需单独提取 → 已随 write 域搬入 WriteMixin；③ 方法内硬编码 `WriteSandboxPlugin._xxx` 需替换为所属 Mixin 名 → 已清零。
 
 ### 12.4 风险与对策
 
@@ -486,3 +504,59 @@ handlers/
 - **循环导入**：已规避（main→handlers 单向）
 - **装饰器**：`@filter.llm_tool` 随方法搬走，handlers 各自 import filter
 - **回滚**：git 基线 70aab3f 已就位，每步 safe_edit 自动备份，出问题随时回退
+
+## 13. 风格卡作品级绑定 + 注入/提炼可选项（汐小姐要求，2026-09-25 立项）
+
+> 【汐小姐要求】① 风格卡跟作品绑定，不是只有默认一张卡——新作品重新调卡，不会调了之后所有写作都用同一张卡；
+> ② 注入先前章节摘要、提取人设卡等作为可选项——之前单元剧写法错误地一直注入无关章节内容当干扰；
+> ③ 角色卡提取太灵敏，卡越积越多却基本用一次就丢，要收紧。
+
+### 13.1 现状（2026-09-25 核对）
+
+| 项 | 当前行为 | 问题 |
+|----|----------|------|
+| 风格卡 | 全局一份 `style_card.json` 主卡 + `style_cards/` 库存 + `style_combo.json` 组合，所有作品共用 | 调一张卡全部作品跟着变，没有作品隔离 |
+| 摘要/设定书注入 | 写正文时（work 模式）无条件 `render_story_memory`（摘要+设定书）+ `render_chapter_outline` + `render_work_characters`（出场角色卡）+ 全局卡选角 | 单元剧每集独立，仍被前面章节摘要/角色干扰 |
+| 角色卡自动提炼 | 每章写完无条件 `_auto_extract_characters`（confidence≥0.6 且 mention_count≥3 建卡） | 一次性龙套也建卡，越积越多、用一次就丢 |
+
+### 13.2 设计（2026-09-25 定稿）
+
+**A. 风格卡作品级绑定**
+- 作品目录 `stories/《作品名>/` 下新增作品级三件套：`style_card.json`（作品主卡）、`style_cards/`（作品卡库）、`style_combo.json`（作品组合）。
+- 读取优先级：当前激活作品时 → 优先作品级卡；作品无卡/未学习 → 回退全局卡；无激活作品 → 全局卡。
+- `sandbox_learn`：有激活作品 → 学进作品卡库 + 设为作品主卡；无 → 存全局卡库 + 全局主卡。
+- `sandbox_style_combo`：按当前激活作品隔离存读（set/list/inspect/clear 均走作品级或全局）。
+- 核心改动在 `core/style.py`：`list_style_cards/load_style_card_by_name/set_combo/clear_combo/get_combo/combo_status/render_combo_card/render_style_card` 全部增加可选 `work` 参数（默认 None=全局），作品路径由 `core/works.py` 提供（`style_card_path(work)/style_cards_dir(work)/combo_file(work)`）。
+
+**B. 注入/提炼可选项（作品级 story_config 开关）**
+- `DEFAULT_STORY_CONFIG` 增加三个布尔开关（默认值见下）：
+  - `inject_memory`（默认 true）：是否注入「摘要流水 + 设定书」（render_story_memory）
+  - `inject_characters`（默认 true）：是否注入「本章出场人设卡 + 全局卡选角」
+  - `auto_extract`（默认 **false**）：每章写完是否自动提炼人设卡（收紧为默认关）
+- 单元剧/独立短篇可把 `inject_memory`、`inject_characters` 关掉，只留本章大纲 + 当前指令，杜绝无关章节串扰。
+- 配置入口：`sandbox_work` 新增 `action=config`（key/value/name），如 `沙盒作品(action=config, name=作品名, key=inject_memory, value=false)`。
+- `handlers/write.py` 的 `_run_write_job`：按 `load_story_config(work)` 判断是否注入 memory / characters / 全局卡选角；写完按 `auto_extract` 决定是否调用 `_auto_extract_characters`。
+
+**C. 角色卡提取收紧**
+- 自动提炼默认关闭（`auto_extract=false`）；开启时仍按原阈值，但只在**本章 + 多章累计出现**的角色里建卡——单章一次性龙套不建。
+- 手动 `sandbox_extract_characters` 保留（明确动作），默认阈值从 0.45/2 次收紧到 0.6/3 次，与自动一致；建卡结果里明确标注「新建 / 已有跳过 / 龙套未建」。
+- 目标：卡库只留真正反复出现的角色，一次性人物进设定书/正文即可。
+
+### 13.3 实施步骤（2026-09-25 已完成 ✅，全部验证通过）
+
+1. `core/constants.py`：`DEFAULT_STORY_CONFIG` 加 `inject_memory/inject_characters/auto_extract` 三开关
+2. `core/works.py`：新增作品级风格卡路径访问（style_card_path/style_cards_dir/combo_file）+ `set_story_config_value(work, key, value)` 配置写入
+3. `core/style.py`：全部卡方法加 `work` 参数与作品级读写（回退全局）
+4. `handlers/learn.py`：学习按激活作品落库 + 设作品主卡
+5. `handlers/misc.py`：`sandbox_style_combo` 按激活作品隔离；`sandbox_work` 加 action=config
+6. `handlers/write.py`：`_run_write_job` 按开关注入 + 按 auto_extract 决定自动提炼；`_auto_extract_characters` 支持多章累计统计
+7. `handlers/character.py`：手动提取阈值收紧到 0.6/3，结果标注分类
+8. 验证：每步 syntax_check + lint_runner + load_plugin 重载冒烟；全量验证后 git commit
+9. 更新本文件标记完成
+
+### 13.4 风险与对策
+
+- **改方法签名**：style 域方法加 `work` 参数后，旧调用（learn.py/misc.py/write.py 无 work 调用）必须兼容默认 None=全局 → 逐个调用点核对
+- **作品路径不存在**：作品切换才建目录，卡方法里对不存在的作品目录直接回退全局
+- **老作品无卡**：回退全局卡，行为与现状一致，不破坏既有写作
+- **回滚**：git 基线 70aab3f 已就位，每步 safe_edit 自动备份

@@ -25,11 +25,16 @@ class StorageMixin:
             d.mkdir(parents=True, exist_ok=True)
 
         self.history_file = user_dir / HISTORY_FILE
-        self.style_card_file = user_dir / STYLE_CARD_FILE
         self.constraints_file = user_dir / CONSTRAINTS_FILE
+        # 全局风格三件套（作品未调过卡时回退到这里，老作品行为不变）
+        self._global_style_card_file = user_dir / STYLE_CARD_FILE
+        self._global_style_cards_dir = user_dir / STYLE_CARDS_DIR_NAME
+        self._global_combo_file = user_dir / COMBO_FILE
+        # 当前风格作用域路径：随激活作品动态切换（_refresh_style_scope 后指向作品或全局）
+        self.style_card_file = self._global_style_card_file
+        self.style_cards_dir = self._global_style_cards_dir
+        self.combo_file = self._global_combo_file
         self.active_work_file = user_dir / ACTIVE_WORK_FILE
-        self.style_cards_dir = user_dir / STYLE_CARDS_DIR_NAME
-        self.combo_file = user_dir / COMBO_FILE
 
         self.constraints: dict[str, Any] = dict(DEFAULT_CONSTRAINTS)
         self.style_card: dict[str, Any] = dict(DEFAULT_STYLE_CARD)
@@ -37,6 +42,79 @@ class StorageMixin:
         self.active_work: Optional[str] = None
         self.style_cards_dir.mkdir(parents=True, exist_ok=True)
         self._load_state()
+        # 初始化后按当前激活作品刷新风格作用域（作品有自己的卡则切到作品，否则留在全局）
+        self._refresh_style_scope()
+
+    def _style_scope_files(self, work: str = "") -> tuple[Path, Path, Path]:
+        """返回风格三件套（主卡/卡库目录/组合）读取作用域。
+
+        作品激活且作品目录下已有任意风格文件 → 用作品自己的三件套（作品独立风格）；
+        否则回退全局三件套（作品没调过卡，老行为不变）。
+        """
+        target = work or self.get_active_work() or ""
+        if target:
+            wd = self.work_dir(target)
+            has_own = (
+                (wd / STYLE_CARD_FILE).exists()
+                or (wd / STYLE_CARDS_DIR_NAME).exists()
+                or (wd / COMBO_FILE).exists()
+            )
+            if has_own:
+                return (wd / STYLE_CARD_FILE, wd / STYLE_CARDS_DIR_NAME, wd / COMBO_FILE)
+        return (self._global_style_card_file, self._global_style_cards_dir, self._global_combo_file)
+
+    def _write_style_scope(self, work: str = "") -> tuple[Path, Path, Path]:
+        """返回风格三件套写入作用域。
+
+        作品激活时永远写入作品自己的目录（作品没卡也会自动建独立三件套，学习/组合落作品库）；
+        未激活作品时写全局。
+        """
+        target = work or self.get_active_work() or ""
+        if target:
+            wd = self.work_dir(target)
+            return (wd / STYLE_CARD_FILE, wd / STYLE_CARDS_DIR_NAME, wd / COMBO_FILE)
+        return (self._global_style_card_file, self._global_style_cards_dir, self._global_combo_file)
+
+    def _refresh_style_scope(self, work: str = "") -> None:
+        """按当前激活作品刷新风格作用域路径与内存态。
+
+        - 作品有自己风格 → 切到作品目录（主卡/组合也读作品那份）；
+        - 作品没有 → 回到全局路径，并恢复全局内存态（老作品行为不变）。
+        """
+        card_file, cards_dir, combo_file = self._style_scope_files(work)
+        self.style_card_file = card_file
+        self.style_cards_dir = cards_dir
+        self.combo_file = combo_file
+        self.style_cards_dir.mkdir(parents=True, exist_ok=True)
+        # 主卡内存态
+        if card_file.exists():
+            try:
+                data = json.loads(card_file.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    self.style_card = data
+            except Exception:
+                pass
+        else:
+            self.style_card = dict(DEFAULT_STYLE_CARD)
+        # 组合内存态
+        if combo_file.exists():
+            try:
+                data = json.loads(combo_file.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    cards = [str(c) for c in (data.get("cards") or []) if str(c)]
+                    dims_raw = data.get("dims") or {}
+                    dims: dict[str, list[str]] = {}
+                    if isinstance(dims_raw, dict):
+                        for k, v in dims_raw.items():
+                            if isinstance(v, list):
+                                dims[str(k)] = [str(x) for x in v if str(x)]
+                            elif v:
+                                dims[str(k)] = [str(v)]
+                    self.combo = {"cards": cards, "dims": dims}
+            except Exception:
+                pass
+        else:
+            self.combo = {"cards": [], "dims": {}}
 
     def _load_state(self) -> None:
         if self.constraints_file.exists():
@@ -87,16 +165,23 @@ class StorageMixin:
             )
 
     def save_style_card(self) -> None:
+        card_file, _, _ = self._write_style_scope()
+        card_file.parent.mkdir(parents=True, exist_ok=True)
         with _LOCK:
-            self.style_card_file.write_text(
+            card_file.write_text(
                 json.dumps(self.style_card, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
 
     def save_style_card_to_library(self, name: str, card: dict) -> Path:
-        """把一张风格卡保存到 style_cards/ 库存，可被 sandbox_style_combo 点名。"""
+        """把一张风格卡保存到当前作用域的 style_cards/ 库存，可被 sandbox_style_combo 点名。
+
+        作品激活时写入作品自己的卡库（学习素材自动落进作品库），否则写全局卡库。
+        """
+        _, cards_dir, _ = self._write_style_scope()
+        cards_dir.mkdir(parents=True, exist_ok=True)
         safe = _safe_title(name, max_len=32) or "未命名风格"
-        path = self.style_cards_dir / f"{safe}.json"
+        path = cards_dir / f"{safe}.json"
         with _LOCK:
             path.write_text(json.dumps(card, ensure_ascii=False, indent=2), encoding="utf-8")
         return path
