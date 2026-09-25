@@ -246,6 +246,123 @@ def build_outline_revise_prompt(instruction: str, current_outline: str, referenc
         .replace("{instruction}", instruction)
     )
 
+# 【汐小姐要求】大纲编写改「说明书模式」：工具不再黑盒生成，而是给主模型一份行动指南，
+# 由主模型照格式框架亲手编写，工具只负责 action=save 收单、结构校验、差异审查与落盘。
+OUTLINE_GUIDE = """你是剧情架构师。用户给出了大纲要求。请按下面的【步骤】和【格式框架】亲手编写一份大纲 JSON，然后调用 sandbox_outline 的 action=save（把 JSON 放进 text 参数）存为待确认草稿。
+
+【步骤】
+1. 先读用户要求：章节数、密度曲线、结局、核心悬念等。
+2. 先定全局脉络（meta），再逐章列节点（chapters）。
+3. 按格式框架组装，保持精炼；最后用 action=save 提交。
+
+【格式框架】（键名固定，禁止改名）
+{
+  "meta": {
+    "title": "作品名（留空由工具补）",
+    "premise": "一句话核心设定",
+    "theme": "主题",
+    "tone": "基调",
+    "arcs": ["主要弧线"],
+    "characters": ["主要角色名"],
+    "scale_map": {"ch1": "尺度标签"}
+  },
+  "chapters": [
+    {
+      "ch": 1,
+      "title": "章题",
+      "summary": "本章概要（≤60字）",
+      "plot_points": ["情节点，每个≤20字"],
+      "characters": ["出场角色"],
+      "tone": "本章基调",
+      "scale": "尺度",
+      "cliffhanger": "结尾钩子",
+      "notes": "补充"
+    }
+  ]
+}
+
+【铁律】
+- chapters 的 ch 从 1 开始连续递增，不得跳号、不得重号。
+- 用户没提到的字段可以省略键，但 ch 和 summary 建议保留；列表没内容给空数组 []。
+- 精炼为上：summary ≤60字、plot_points 每个 ≤20字，不写废话。
+- 只输出 JSON，不要输出任何其他文字，不要输出说明或 diff。
+"""
+
+
+def build_outline_guide(instruction: str, reference: str = "") -> str:
+    return (
+        OUTLINE_GUIDE
+        + "\n\n【用户大纲要求】\n"
+        + instruction
+        + "\n\n【参考信息】（已有作品摘要与设定书，用于对齐；可为空）\n"
+        + (reference or "（无）")
+    )
+
+
+# 【汐小姐要求】大纲微调同样改「说明书模式」：只改用户点名部分，其余原样保留；save 时做程序级差异审查。
+OUTLINE_REVISE_GUIDE = """你是剧情架构师。用户要求在「现有大纲」基础上做**局部修订**。请只改用户点名要求的部分，其余节点一个字符都不许动，然后调用 sandbox_outline 的 action=save（把修订后的完整大纲 JSON 放进 text 参数）提交。
+
+【与全新生成的区别】
+- 只修改用户点名要求的部分；未被要求改动的 meta 字段与章节节点必须**原样保留**（直接复制，不要重写润色）。
+- 章节总数原则上不变；用户明确要求增删章节时才增删，且要保证 chapters 编号连续（ch 从 1 起递增）。
+- 人物增删只发生在用户点名时：新增角色要写清定位与弧线；删除角色要同时把它从相关章节的 characters 出场名单里移除，并检查其他角色 relations 里不再引用它。
+- 结构固定，与现有大纲一致：meta + chapters（ch/title/summary/plot_points/characters/tone/scale/cliffhanger/notes）。
+- 精炼为上：summary ≤60字、plot_points 每个 ≤20字，整体 JSON 越短越好。
+- 只输出修订后的完整大纲 JSON，不要输出任何其他文字，也不要输出 diff 或说明。
+
+【现有大纲】
+{current_outline}
+
+【参考信息】（已有作品的摘要与设定书，用于对齐已写内容；可为空）
+{reference}
+
+【用户调整要求】
+{instruction}
+"""
+
+
+def build_outline_revise_guide(instruction: str, current_outline: str, reference: str = "") -> str:
+    return (
+        OUTLINE_REVISE_GUIDE
+        .replace("{current_outline}", current_outline or "（无现有大纲）")
+        .replace("{reference}", reference or "（无）")
+        .replace("{instruction}", instruction)
+    )
+
+
+# 正文：局部修订（用户指定改哪里，不整篇推翻）
+REVISE_TEXT_PROMPT = """你是小说编辑。任务：根据用户的修改要求，对下面的正文做**局部修订**，只输出编辑指令 JSON 数组，不要输出任何其他文字。
+
+【输出格式】JSON 数组，每项：
+{"find": "正文里能唯一定位的连续原文片段", "replace": "替换后的文本"}
+
+【编辑指令语义】
+- replace 不为空 = 把 find 那段原文替换成 replace（改写/润色）。
+- replace 为空字符串 "" = 删除 find 指定的片段（含其前后标点）。
+- 想在某处插入新内容：find 用紧邻的锚点片段，replace 写成「锚点原文 + 新内容」（锚点后插入），或「新内容 + 锚点原文」（锚点前插入）。
+- 锚点本身必须逐字保留在 replace 里，只在它基础上增删。
+
+【铁律】
+1. find 必须是正文中逐字存在的连续片段（建议 6~80 字），能在全文唯一定位；找不到唯一片段就少写几条，绝不编造、绝不近似匹配。
+2. 只改用户点名要求涉及的内容；未被要求的文字一个字符都不许动。
+3. 不新增/删除/改写剧情事件、设定、人名；人物语气与性格保持一致；删除只发生在用户明确要求删的时候。
+4. 用户要求涉及大段改写（超过约 300 字）时：拆成多条相邻的编辑指令逐句处理，或只改最核心的 1~2 句并保持其余不动。
+5. 最多 20 条；拿不准的宁可不改。
+
+【全文】
+{full_text}
+
+【用户修改要求】
+{instruction}
+"""
+
+
+def build_revise_text_prompt(instruction: str, full_text: str) -> str:
+    return (
+        REVISE_TEXT_PROMPT
+        .replace("{full_text}", full_text or "（空）")
+        .replace("{instruction}", instruction)
+    )
 # 长文：人设卡（统一格式，全局/作品双存储）
 CHARACTER_PROMPT = """你是人设设计师。任务：根据用户的一句话描述，生成一张结构化「人设卡 JSON」。
 
@@ -305,6 +422,71 @@ CHARACTER_PROMPT = """你是人设设计师。任务：根据用户的一句话�
 def build_character_prompt(description: str, reference: str = "") -> str:
     return (
         CHARACTER_PROMPT
+        .replace("{description}", description)
+        .replace("{reference}", reference or "（无）")
+    )
+
+
+# 【汐小姐要求】人设卡编写改「说明书模式」：工具不再黑盒生成，而是给主模型一份行动指南，
+# 由主模型照格式框架亲手编写，工具只负责 action=save 收单、结构校验与落盘。
+CHARACTER_GUIDE = """你是人设设计师。用户给了角色描述。请按下面的【步骤】和【格式框架】亲手编写一张人设卡 JSON，然后调用 sandbox_character 的 action=save（把 JSON 放进 text 参数）落盘。
+
+【步骤】
+1. 先读用户描述与参考信息，圈出明确提到的条目（身份/外貌/性格/口头禅等）。
+2. 只填用户明确提到的条目；没提到的键一律省略，不默认补全。
+3. 按下面的格式框架组装 JSON。
+
+【格式框架】（键名固定，禁止改名）
+{
+  "basic": {
+    "name": "姓名（必填，没有就留空由工具补）",
+    "aliases": ["别名，数组"],
+    "gender": "性别",
+    "age": "年龄/外貌年龄",
+    "identity": "身份/职业",
+    "appearance": "外貌（发色瞳色体型服饰标志特征）",
+    "personality": "性格核心（3~5条，含缺点）",
+    "quirks": ["习惯/小动作，数组"]
+  },
+  "background": {
+    "origin": "出身来历",
+    "motivation": "核心动机",
+    "secrets": ["秘密/软肋，数组"],
+    "relations": [ { "name": "与谁", "relation": "关系", "note": "现状" } ]
+  },
+  "story": {
+    "role": "定位（主角/配角/反派）",
+    "arc": "人物弧线",
+    "plot_hooks": ["剧情钩子/伏笔，数组"],
+    "scale_role": "涩涩参与度（高/中/低/无）"
+  },
+  "speech": {
+    "tone": "说话腔调",
+    "catchphrases": ["口头禅，数组"],
+    "address_style": "称呼他人方式"
+  }
+}
+
+【铁律】（违反即废卡）
+- 所有字段都是可选项：用户描述/参考信息里明确提到的条目才填写；没提到的条目一律省略该键，不要默认补全。
+- 禁止脑补用户没提到的字段内容，尤其不要自动生成人物弧线、剧情钩子、秘密、口头禅、称呼方式、关系等；用户没给就省略。
+- 字符串类条目没内容就省略该键；列表类条目没内容就给空数组 []。
+- personality 用户提到性格才填；若用户只给了一点线索，只写那一点，不扩写缺点。
+- scale_role 只在用户明确提到尺度或能直接判断时填写，判断不了就省略。
+- relations 只写用户明确提到的关系人；数组元素必须有 name 和 relation；没有可写对象时留空数组，绝不虚构人名。
+- 只输出 JSON，不要输出任何其他文字。
+
+【用户描述】
+{description}
+
+【参考信息】（可选，已有作品设定书/大纲片段）
+{reference}
+"""
+
+
+def build_character_guide(description: str, reference: str = "") -> str:
+    return (
+        CHARACTER_GUIDE
         .replace("{description}", description)
         .replace("{reference}", reference or "（无）")
     )

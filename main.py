@@ -7,6 +7,7 @@ llm_tool，插件以独立沙盒上下文 + 风格卡 + 约束生成文字，自
 from __future__ import annotations
 
 import asyncio
+import difflib
 import json
 import math
 import os
@@ -34,9 +35,11 @@ from .prompts import (
     build_context_snippet,
     build_chapter_summary_prompt,
     build_story_state_prompt,
-    build_outline_prompt,
-    build_outline_revise_prompt,
+    build_outline_guide,
+    build_outline_revise_guide,
+    build_revise_text_prompt,
     build_character_prompt,
+    build_character_guide,
     build_character_extract_prompt,
     build_global_card_select_prompt,
 )
@@ -178,6 +181,8 @@ class WriteSandboxPlugin(Star):
 
         当用户明确要求「写一段文字/故事/涩涩内容/情色描写/小说片段」，
         或要求「按我的素材风格写」「续写/改写上一段」时调用本工具。
+        用户要求「把某句/某段改成……」「删掉那句话」「在某处加一句」等指定内容的修改时：
+        用 mode=revise，只精确改动点名位置，不整篇推翻。
         长篇模式：用户提到作品名（如「写《雾都夜行》第3章」）时把作品名传入 work，
         正文会存进该作品的章节目录，并自动生成章节摘要、更新设定书。
         长文会自动分成每节约 4000 字的小节在后台逐节写；用户中途问进度时调用 sandbox_progress 工具。
@@ -186,7 +191,7 @@ class WriteSandboxPlugin(Star):
 
         Args:
             instruction(string): 用户想要的内容描述，例如「她推门进来，雨还没干」「尺度拉高，重点写触感」。
-            mode(string): generate=新写一段（长篇模式下为新章节）；continue=接着上一段续写；rewrite=按新要求重写上一段/指定章节。
+            mode(string): generate=新写一段（长篇模式下为新章节）；continue=接着上一段续写；rewrite=按新要求重写上一段/指定章节；revise=按指定内容局部修订（只改点名部分，不整篇推翻）。
             tag(string): 可选，给这段文字起个名字，会用在文件名上。
             work(string): 可选，长篇作品名。传入则切换/新建该作品工作区；留空沿用当前激活作品。
             chapter(int): 可选，目标章节号。rewrite 指定章节（如重写第8章→8）或 generate 指定位置时用；0=自动判断。
@@ -242,6 +247,10 @@ class WriteSandboxPlugin(Star):
                 f"后台已经有一个写作任务（{old['job_id']}）在进行中啦，"
                 "等它写完人家再开新的，或者先查一下进度♪"
             )
+
+        # 局部修订模式：不重写整段，按用户指定内容精确修改（复用哨兵「编辑指令+精确应用」机制），同步执行
+        if mode == "revise":
+            return await self._run_revise(sandbox, instruction, work, chapter)
 
         self._job_seq += 1
         job = {
@@ -371,19 +380,15 @@ class WriteSandboxPlugin(Star):
         return 0
 
     def _plan_sections(self, job: dict) -> int:
-        """根据指令与长度约束估算分节数；无明确要求时默认 1 节。"""
+        """估算起始分节数。有明确字数按字数拆（每节约4000字）；无明确字数从1节起步，由剧情驱动动态续写。"""
         instruction = job["instruction"]
         length_cfg = str((job["sandbox"].constraints or {}).get("length", ""))
         target = self._parse_target_chars(f"{instruction}\n{length_cfg}")
-        if target > self._SECTION_TARGET_CHARS:
+        job["_target_chars"] = target
+        if target > 0:
             n = math.ceil(target / self._SECTION_TARGET_CHARS)
             return max(1, min(n, self._MAX_SECTIONS))
-        long_hints = (
-            "长文", "整章", "全篇", "写满", "连载", "长篇",
-            "越多越好", "尽量长", "一段很长的", "把这段写长", "写一整章",
-        )
-        if any(h in instruction for h in long_hints):
-            return min(3, self._MAX_SECTIONS)
+        # 无明确字数：不预设节数，每节写完由剧情是否收尾决定是否新增下一节
         return 1
 
     async def _run_write_job(self, job: dict) -> None:
@@ -416,8 +421,9 @@ class WriteSandboxPlugin(Star):
             parts_written: list[str] = []
             file_path = None
 
-            for i in range(1, total + 1):
-                chunk = await self._write_section(job, i, total, parts_written, story_context)
+            i = 1
+            while True:
+                chunk, ended_mark = await self._write_section(job, i, total, parts_written, story_context)
                 if chunk is None:
                     job["status"] = "failed"
                     job["error"] = f"第 {i} 节连续生成失败（已重试 {self._SECTION_RETRY} 次）"
@@ -435,6 +441,13 @@ class WriteSandboxPlugin(Star):
                 sandbox.append_history("assistant", chunk)
                 parts_written.append(chunk)
                 job["section_idx"] = i
+                # 剧情驱动：每节写完判断是否自然收尾；收尾或触顶即停，否则自动新增一节
+                if ended_mark is None:
+                    ended_mark = await self._check_story_ended(job, chunk)
+                job["section_total"] = i
+                if ended_mark or i >= self._MAX_SECTIONS:
+                    break
+                i += 1
 
             # 整章完成：按模式落位 → 摘要 + 设定书（也在后台做，不阻塞任何人）
             if work:
@@ -555,8 +568,8 @@ class WriteSandboxPlugin(Star):
         total: int,
         parts_written: list[str],
         story_context: str,
-    ) -> Optional[str]:
-        """生成单个分节，失败自动重试；连续失败返回 None。"""
+    ) -> tuple[Optional[str], Optional[bool]]:
+        """生成单个分节，失败自动重试；连续失败返回 (None, None)。附带剧情是否收尾的标记。"""
         sandbox: Sandbox = job["sandbox"]
         instruction = job["instruction"]
         mode = job["mode"]
@@ -587,13 +600,19 @@ class WriteSandboxPlugin(Star):
         )
 
         # 分节说明：让模型知道当前在第几节、目标长度、是否收尾
+        dynamic = target <= 0
         per_section = math.ceil(target / total) if target > 0 else self._SECTION_TARGET_CHARS
-        section_note = (
-            f"\n\n【分节写作】本次任务共 {total} 节，每节约 {per_section} 字"
-            f"（全篇目标约 {target if target > 0 else '未指定'} 字）。"
-            f"现在写第 {idx}/{total} 节。"
-        )
-        if total > 1:
+        if dynamic:
+            section_note = (
+                f"\n\n【分节写作】本次不预设总节数与总长，由剧情自然推进。"
+                f"现在写第 {idx} 节，写到本节自然段落即可停笔。"
+            )
+        else:
+            section_note = (
+                f"\n\n【分节写作】本次任务共 {total} 节，每节约 {per_section} 字"
+                f"（全篇目标约 {target} 字）。"
+                f"现在写第 {idx}/{total} 节。"
+            )
             if idx < total:
                 section_note += (
                     "\n- 非最后一节：写到本节目标长度即可自然暂收，"
@@ -601,6 +620,11 @@ class WriteSandboxPlugin(Star):
                 )
             else:
                 section_note += "\n- 最后一节：在保持风格的前提下把整篇收束完整。"
+        # 剧情收尾标记：每节都要求，系统据此决定是否自动新增下一节
+        section_note += (
+            "\n- 本节正文写完后，另起一行单独输出状态标记（不要混进正文）："
+            "剧情已经自然收尾就输出【STORY_END】，还没收尾就输出【STORY_CONTINUE】。"
+        )
 
         if idx == 1:
             if mode == "continue":
@@ -642,13 +666,18 @@ class WriteSandboxPlugin(Star):
             text = self._clean(raw)
             if text:
                 text = self._apply_banned_words(text, sandbox)
-                # 长度兜底：不足本节目标时自动续写补足，防止「写短了就交差」
-                if per_section > 0:
+                text, ended_mark = self._strip_story_mark(text)
+                # 长度兜底：仅明确字数模式启用；剧情驱动模式尊重自然收尾，不硬凑字数
+                if not dynamic and per_section > 0:
                     text = await self._ensure_section_length(
                         text, per_section, system_prompt, sandbox
                     )
-                return text
-        return None
+                    text, m2 = self._strip_story_mark(text)
+                    if m2 is not None:
+                        ended_mark = m2
+                if text.strip():
+                    return text, ended_mark
+        return None, None
 
     async def _ensure_section_length(
         self,
@@ -676,6 +705,28 @@ class WriteSandboxPlugin(Star):
                 break
             text = text + "\n\n" + ext
         return self._apply_banned_words(text, sandbox)
+
+    @staticmethod
+    def _strip_story_mark(text: str) -> tuple[str, Optional[bool]]:
+        """剥离文末剧情状态标记行，返回 (正文, 是否已收尾)；无标记时返回 (原文, None)。"""
+        m = re.search(r"\s*【(STORY_END|STORY_CONTINUE)】\s*$", text)
+        if m:
+            body = text[: m.start()].rstrip()
+            return body, (m.group(1) == "STORY_END")
+        return text, None
+
+    async def _check_story_ended(self, job: dict, chunk: str) -> bool:
+        """模型未输出状态标记时的兜底：轻量询问剧情是否已自然收尾。"""
+        tail = (chunk or "")[-1200:]
+        if not tail.strip():
+            return True
+        prompt = (
+            f"下面是一篇小说当前写到的一段结尾：\n\n{tail}\n\n"
+            "请判断故事到这里是否已经自然收尾"
+            "（情节完整落幕、没有明显未交代的走向）。只回答两个字：是 或 否。"
+        )
+        raw = await self._llm_chat(prompt, timeout=60.0)
+        return "是" in (raw or "")[:20]
 
     async def _notify(self, job: dict, failed: bool) -> None:
         """后台任务完成后主动推送消息到原会话。"""
@@ -713,6 +764,44 @@ class WriteSandboxPlugin(Star):
             await self.context.send_message(job["session"], chain)
         except Exception as e:
             logger.error(f"后台写作通知发送失败: {e}")
+
+    @staticmethod
+    def _parse_edit_json(raw: str) -> list[dict]:
+        """容错解析 LLM 输出的编辑指令 JSON 数组（[{find, replace}, ...]）。"""
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return [e for e in parsed if isinstance(e, dict)]
+        except Exception:
+            pass
+        m = re.search(r"\[[\s\S]*\]", raw)
+        if m:
+            try:
+                parsed = json.loads(m.group(0))
+                if isinstance(parsed, list):
+                    return [e for e in parsed if isinstance(e, dict)]
+            except Exception:
+                pass
+        return []
+
+    @staticmethod
+    def _apply_edits(text: str, edits: list[dict]) -> tuple[str, int, int]:
+        """把编辑指令精确应用到正文：find 必须在文本中唯一定位（count==1）才替换，否则跳过。
+        返回 (新文本, 应用数, 跳过数)。"""
+        new_text = text
+        applied = skipped = 0
+        for ed in edits:
+            find = str(ed.get("find", "") or "").strip()
+            replace = str(ed.get("replace", "") or "")
+            if not find or find == replace:
+                skipped += 1
+                continue
+            if new_text.count(find) == 1:
+                new_text = new_text.replace(find, replace)
+                applied += 1
+            else:
+                skipped += 1
+        return new_text, applied, skipped
 
     async def _revise_repeated(self, sandbox: Sandbox, full_text: str, work: str) -> tuple[str, str]:
         """口水词小哨兵自动修订：把检查结果交给 LLM 判断，输出编辑指令后由程序精确应用。
@@ -761,39 +850,105 @@ class WriteSandboxPlugin(Star):
         )
         raw = await self._llm_chat(prompt, system_prompt="你只输出 JSON 数组，不要输出任何其他文字。")
         raw = self._clean(raw)
-        edits: list[dict] = []
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, list):
-                edits = [e for e in parsed if isinstance(e, dict)]
-        except Exception:
-            m = re.search(r"\[[\s\S]*\]", raw)
-            if m:
-                try:
-                    parsed = json.loads(m.group(0))
-                    if isinstance(parsed, list):
-                        edits = [e for e in parsed if isinstance(e, dict)]
-                except Exception:
-                    edits = []
+        edits = self._parse_edit_json(raw)
         if not edits:
             return full_text, "哨兵检查到问题，但自动修订未能生成可靠编辑指令，已保留原文。"
-        new_text = full_text
-        applied = skipped = 0
-        for ed in edits:
-            find = str(ed.get("find", "") or "").strip()
-            replace = str(ed.get("replace", "") or "")
-            if not find or find == replace:
-                skipped += 1
-                continue
-            if new_text.count(find) == 1:
-                new_text = new_text.replace(find, replace)
-                applied += 1
-            else:
-                skipped += 1
+        new_text, applied, skipped = self._apply_edits(full_text, edits)
         if applied == 0:
             return full_text, "哨兵检查到问题，但编辑指令未能命中正文，已保留原文。"
         note = f"哨兵已做一轮自动修订：应用 {applied} 处、跳过 {skipped} 处。"
         return new_text, note
+
+    # ── 正文局部修订（mode=revise，汐小姐要求：按指定内容修改，不整篇推翻）──
+    def _read_target_text(self, sandbox: Sandbox, work: str, chapter: int) -> tuple[str, Optional[Path], str]:
+        """确定局部修订的目标正文与文件路径。
+        返回 (全文, 目标文件路径, 定位说明)；找不到返回 ("", None, 原因)。"""
+        if work:
+            ch = chapter
+            if not (ch and ch > 0):
+                ch = sandbox.latest_chapter_no(work)
+            if ch and ch > 0 and sandbox.chapter_exists(work, ch):
+                d = sandbox.chapters_dir(work)
+                files = sorted(d.glob(f"ch{int(ch):02d}*.txt"))
+                if files:
+                    try:
+                        text = files[0].read_text(encoding="utf-8")
+                        if text.strip():
+                            return text, files[0], f"《{work}》第{ch}章"
+                    except Exception:
+                        pass
+            drafts = sorted(sandbox.drafts_dir(work).glob("*.txt"),
+                            key=lambda p: p.stat().st_mtime, reverse=True)
+            if drafts:
+                try:
+                    text = drafts[0].read_text(encoding="utf-8")
+                    if text.strip():
+                        return text, drafts[0], f"《{work}》草稿（尚未定章）"
+                except Exception:
+                    pass
+            return "", None, f"《{work}》还没有可修订的正文"
+        p = sandbox.latest_output_path()
+        if p and p.exists():
+            try:
+                text = p.read_text(encoding="utf-8")
+                if text.strip():
+                    return text, p, "最近一篇产出"
+            except Exception:
+                pass
+        return "", None, "还没有写过可修订的内容"
+
+    async def _revise_text(self, sandbox: Sandbox, instruction: str, full_text: str) -> tuple[str, str]:
+        """正文局部修订核心：把用户要求 + 全文交给 LLM，输出编辑指令后由程序精确应用。
+        只执行一轮；仅替换能在正文中唯一定位的片段。返回 (修订后文本, 修订说明)。"""
+        text_for_llm = full_text
+        truncated = False
+        if len(full_text) > 24000:
+            text_for_llm = full_text[:24000]
+            truncated = True
+        prompt = build_revise_text_prompt(instruction, text_for_llm)
+        if truncated:
+            prompt += "\n\n（注：原文过长已截断前 24000 字符；若要修改截断范围外的内容，请分次进行）"
+        raw = await self._llm_chat(prompt, system_prompt="你只输出 JSON 数组，不要输出任何其他文字。")
+        raw = self._clean(raw)
+        edits = self._parse_edit_json(raw)
+        if not edits:
+            return full_text, "未能生成可靠的编辑指令，已保留原文。"
+        new_text, applied, skipped = self._apply_edits(full_text, edits)
+        if applied == 0:
+            return full_text, f"编辑指令未能命中正文（跳过 {skipped} 处），已保留原文。"
+        return new_text, f"局部修订完成：应用 {applied} 处、跳过 {skipped} 处。"
+
+    async def _run_revise(self, sandbox: Sandbox, instruction: str, work: str, chapter: int) -> str:
+        """mode=revise 同步执行：读取目标正文 → LLM 编辑指令 → 程序精确应用 → 覆盖落盘。"""
+        full_text, target_path, where = self._read_target_text(sandbox, work, chapter)
+        if not full_text:
+            return where
+        revised, note = await self._revise_text(sandbox, instruction, full_text)
+        if revised == full_text:
+            return f"{where}：{note}"
+        try:
+            target_path.write_text(revised.rstrip() + "\n", encoding="utf-8")
+        except Exception as e:
+            logger.error(f"局部修订落盘失败: {e}")
+            return f"{where}：修订完成但落盘失败（{e}）。\n{note}"
+        changes: list[str] = []
+        sm = difflib.SequenceMatcher(None, full_text.splitlines(), revised.splitlines())
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag == "equal":
+                continue
+            old_part = " / ".join(full_text.splitlines()[i1:i2])[:80]
+            new_part = " / ".join(revised.splitlines()[j1:j2])[:80]
+            changes.append(f"· {old_part}  →  {new_part}")
+            if len(changes) >= 5:
+                break
+        lines = [f"【局部修订♪】{where}已按你的要求改好啦。", note]
+        if changes:
+            lines.append("改动摘要：")
+            lines.extend(changes)
+            if len(changes) >= 5:
+                lines.append("…（还有更多改动，详见文件）")
+        lines.append(f"已保存：{target_path}")
+        return "\n".join(lines)
 
     # ═══════════════════════════════════════════
     # 工具 1.5：沙盒进度（后台任务状态查询）
@@ -1299,6 +1454,113 @@ class WriteSandboxPlugin(Star):
     # ═══════════════════════════════════════════
     # 工具 5.6：沙盒大纲（作品大纲 JSON：全局脉络 + 分章节点）
     # ═══════════════════════════════════════════
+    # ── 【汐小姐要求】说明书模式的收单校验器（纯代码，非 LLM）──
+    @staticmethod
+    def _validate_character_card(card: dict) -> tuple[bool, list[str]]:
+        """人设卡结构校验：段必须是对象、列表字段必须是数组、relations 每项必须有 name。
+        返回 (是否通过, 问题列表)。"""
+        problems: list[str] = []
+        if not isinstance(card, dict):
+            return False, ["卡片必须是 JSON 对象"]
+        for section in ("basic", "background", "story", "speech"):
+            v = card.get(section)
+            if v is not None and not isinstance(v, dict):
+                problems.append(f"「{section}」应为对象")
+        list_fields = {
+            "basic": ("aliases", "quirks"),
+            "background": ("secrets", "relations"),
+            "story": ("plot_hooks",),
+            "speech": ("catchphrases",),
+        }
+        for section, keys in list_fields.items():
+            sec = card.get(section)
+            if not isinstance(sec, dict):
+                continue
+            for k in keys:
+                v = sec.get(k)
+                if v is not None and not isinstance(v, list):
+                    problems.append(f"「{section}.{k}」应为数组")
+        bg = card.get("background")
+        if isinstance(bg, dict):
+            relations = bg.get("relations")
+            if isinstance(relations, list):
+                for i, r in enumerate(relations, start=1):
+                    if not isinstance(r, dict) or not str(r.get("name") or "").strip():
+                        problems.append(
+                            f"relations 第 {i} 项缺少 name（应为 {{\"name\": \"与谁\", \"relation\": \"关系\", \"note\": \"现状\"}}）"
+                        )
+        return len(problems) == 0, problems
+
+    @staticmethod
+    def _validate_outline(outline: dict) -> tuple[bool, list[str]]:
+        """大纲结构校验：meta/chapters 结构、ch 从 1 连续递增、字段类型。
+        返回 (是否通过, 问题列表)。"""
+        problems: list[str] = []
+        if not isinstance(outline, dict):
+            return False, ["大纲必须是 JSON 对象"]
+        if not isinstance(outline.get("meta"), dict):
+            problems.append("meta 必须是对象（含 title/premise/theme 等）")
+        chapters = outline.get("chapters")
+        if not isinstance(chapters, list):
+            return False, problems + ["chapters 必须是数组"]
+        if not chapters:
+            problems.append("chapters 不能为空数组，至少要有章节节点")
+        seen: set[int] = set()
+        for i, node in enumerate(chapters, start=1):
+            if not isinstance(node, dict):
+                problems.append(f"第 {i} 个章节节点不是对象")
+                continue
+            ch = node.get("ch")
+            if not isinstance(ch, int):
+                problems.append(f"第 {i} 个章节节点缺 ch（必须是数字，从 1 连续递增）")
+                continue
+            if ch in seen:
+                problems.append(f"章号重复：ch={ch}")
+            seen.add(ch)
+            if ch != i:
+                problems.append(f"章号不连续：第 {i} 个节点 ch={ch}（应为 {i}，需从 1 连续递增）")
+            for key in ("summary", "title", "tone", "scale", "cliffhanger", "notes"):
+                v = node.get(key)
+                if v is not None and not isinstance(v, str):
+                    problems.append(f"第 {ch} 章「{key}」应为字符串")
+            for key in ("plot_points", "characters"):
+                v = node.get(key)
+                if v is not None and not isinstance(v, list):
+                    problems.append(f"第 {ch} 章「{key}」应为数组")
+        return len(problems) == 0, problems
+
+    @staticmethod
+    def _diff_outline_chapters(old: dict, new: dict) -> list[str]:
+        """对比新旧大纲的章节节点，列出被新增/删除/改动的章（程序级差异审查，
+        防止模型顺手改没让改的地方）。"""
+        old_chs = {c.get("ch"): c for c in old.get("chapters") or [] if isinstance(c, dict)}
+        new_chs = {c.get("ch"): c for c in new.get("chapters") or [] if isinstance(c, dict)}
+        lines: list[str] = []
+        for ch in sorted(set(new_chs) - set(old_chs)):
+            lines.append(f"新增 第{ch}章「{(new_chs[ch].get('title') or '')[:30]}」")
+        for ch in sorted(set(old_chs) - set(new_chs)):
+            lines.append(f"删除 第{ch}章「{(old_chs[ch].get('title') or '')[:30]}」")
+        for ch in sorted(set(old_chs) & set(new_chs)):
+            if old_chs[ch] != new_chs[ch]:
+                lines.append(f"改动 第{ch}章「{(new_chs[ch].get('title') or '')[:30]}」")
+        return lines
+
+    @staticmethod
+    def _build_card_update_guide() -> str:
+        """人设卡字段编辑说明书：update 识别不了自然语言时，指引主模型如何组织指令或改用 save 提交。"""
+        return (
+            "【字段编辑说明书】update 是纯代码字段合并，只认严格指令，建议这样组织：\n"
+            "可用字段：称呼方式、说话腔调/腔调、口头禅、别名、性别、年龄、身份、外貌、性格、"
+            "习惯小动作/小动作、出身来历/出身、核心动机/动机、秘密/软肋、关系、定位、人物弧线、"
+            "剧情钩子、涩涩参与度/尺度。\n"
+            "指令写法：\n"
+            "- 「X 改为 Y」→ 覆盖该字段\n"
+            "- 「删除 X」→ 清空该字段\n"
+            "- 「把性格改成……」「口头禅改为……，再加一句……」→ 用原话描述目标值\n"
+            "如果用户要求比较自然语言化（如「性格改得更阴郁些」），直接按 action=create 的说明书"
+            "重写完整卡片，用 action=save 提交（会覆盖同名卡）。"
+        )
+
     @filter.llm_tool(name="sandbox_outline")
     async def sandbox_outline(
         self,
@@ -1322,7 +1584,7 @@ class WriteSandboxPlugin(Star):
 
         Args:
             instruction(string): 大纲要求，如「十章，涩涩密度前期暧昧后期露骨，结局留白」。
-            action(string): write=生成草稿（默认）；revise=基于现有大纲微调（局部修改不推倒重来）；confirm=确认草稿落盘；discard=丢弃草稿；view=查看；note=挂灵感便签；clearnote=清空便签；link=设置章节接续。
+            action(string): write=返回大纲编写说明书（默认，主模型按指南写好 JSON 后用 save 提交）；save=收下主模型写好的大纲 JSON（放 text 参数），做结构校验+差异审查后存为待确认草稿；revise=返回大纲修订说明书（只改点名部分，不推倒重来）；confirm=确认草稿落盘；discard=丢弃草稿；view=查看；note=挂灵感便签；clearnote=清空便签；link=设置章节接续。
             work(string): 可选，作品名。传入则切换/新建该作品；留空沿用当前激活作品。
             name(string): 兼容旧参数名，等价于 work。
             ch(int): note/clearnote 时指定章节号。
@@ -1383,23 +1645,30 @@ class WriteSandboxPlugin(Star):
         if action == "revise":
             current = sandbox.load_outline(active)
             if not current.get("chapters"):
-                return f"《{active}》还没有正式大纲，先写一份再微调（用 action=write）。"
+                return f"《{active}》还没有正式大纲，先写一份再微调（用 action=write 拿说明书）。"
             if not instruction.strip():
                 return "微调大纲需要说明改哪里，例如「把第3章改成雨夜重逢，删掉陆岑的戏份，新增一个女管家角色」。"
-            prompt = build_outline_revise_prompt(
+            guide = build_outline_revise_guide(
                 instruction=instruction,
                 current_outline=json.dumps(current, ensure_ascii=False, indent=2),
                 reference=sandbox.render_story_memory(active)[:1500],
             )
-            raw = await self._llm_chat(prompt, system_prompt="你只输出 JSON，不要输出任何其他文字。")
-            raw = self._clean(raw)
+            return (
+                "【大纲修订说明书】人家把现有大纲和修订规则给你：只改用户点名的部分，其余节点原样保留。"
+                "改好后调用 sandbox_outline 的 action=save（把修订后的完整大纲 JSON 放进 text 参数）提交，"
+                "人家会做程序级差异审查。\n\n"
+                + guide
+            )
+        if action == "save":
+            if not text.strip():
+                return "save 需要把写好的大纲 JSON 放进 text 参数（照着 action=write 返回的说明书编写）。"
             outline: Optional[dict] = None
             try:
-                parsed = json.loads(raw)
+                parsed = json.loads(text)
                 if isinstance(parsed, dict):
                     outline = parsed
             except Exception:
-                m = re.search(r"\{.*\}", raw, re.S)
+                m = re.search(r"\{.*\}", text, re.S)
                 if m:
                     try:
                         parsed = json.loads(m.group(0))
@@ -1408,62 +1677,42 @@ class WriteSandboxPlugin(Star):
                     except Exception:
                         pass
             if outline is None:
-                return "大纲微调解析失败了，请再试一次，或换个说法描述调整要求。"
+                return "save 收到的大纲不是合法 JSON 对象，请对照说明书重新整理后提交。"
             meta = outline.get("meta") if isinstance(outline.get("meta"), dict) else {}
             meta["title"] = meta.get("title") or active
             outline["meta"] = meta
             if not isinstance(outline.get("chapters"), list):
                 outline["chapters"] = []
+            ok, problems = self._validate_outline(outline)
+            if not ok:
+                return (
+                    "大纲校验未通过，打回重写：\n- " + "\n- ".join(problems)
+                    + "\n\n（对照 action=write 返回的说明书修正后，重新 save）"
+                )
+            diff_lines: list[str] = []
+            old = sandbox.load_outline(active)
+            if old.get("chapters"):
+                diff_lines = self._diff_outline_chapters(old, outline)
             sandbox.save_pending_outline(active, outline)
             n = len(outline["chapters"])
-            audit_note = ""
-            try:
-                rep = sandbox.render_character_audit(active)
-                if "没有发现" not in rep:
-                    audit_note = "\n\n【微调后人物卡复核】\n" + rep + "\n（确认大纲后记得清理无关卡♪）"
-            except Exception:
-                pass
-            return (
-                f"《{active}》大纲微调草稿已生成（共 {n} 个章节节点），"
+            head = (
+                f"《{active}》大纲草稿已收下（共 {n} 个章节节点），"
                 "先审核一下，确认后人家再落盘生效：\n\n"
                 + sandbox.render_pending_outline(active)
-                + audit_note
             )
+            if diff_lines:
+                head += "\n\n【程序差异审查】与正式大纲相比，本次改动涉及：\n- " + "\n- ".join(diff_lines[:10])
+            return head
         if not instruction.strip():
             return "写大纲需要说明要求，例如「十章，暧昧转露骨，主角身世是核心悬念」。"
-        prompt = build_outline_prompt(
+        guide = build_outline_guide(
             instruction=instruction,
             reference=sandbox.render_story_memory(active)[:1500],
         )
-        raw = await self._llm_chat(prompt, system_prompt="你只输出 JSON，不要输出任何其他文字。")
-        raw = self._clean(raw)
-        outline: Optional[dict] = None
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                outline = parsed
-        except Exception:
-            m = re.search(r"\{.*\}", raw, re.S)
-            if m:
-                try:
-                    parsed = json.loads(m.group(0))
-                    if isinstance(parsed, dict):
-                        outline = parsed
-                except Exception:
-                    pass
-        if outline is None:
-            return "大纲解析失败了，请再试一次，或换个说法描述要求。"
-        meta = outline.get("meta") if isinstance(outline.get("meta"), dict) else {}
-        meta["title"] = meta.get("title") or active
-        outline["meta"] = meta
-        if not isinstance(outline.get("chapters"), list):
-            outline["chapters"] = []
-        sandbox.save_pending_outline(active, outline)
-        n = len(outline["chapters"])
         return (
-            f"《{active}》大纲草稿已生成（共 {n} 个章节节点），"
-            "先审核一下，确认后人家再落盘生效：\n\n"
-            + sandbox.render_pending_outline(active)
+            "【大纲说明书】人家先把编写指南给你，你照这个格式亲手写好大纲 JSON，"
+            "然后调用 sandbox_outline 的 action=save（把 JSON 放进 text 参数）存为待确认草稿。\n\n"
+            + guide
         )
 
     # ═══════════════════════════════════════════
@@ -1478,6 +1727,7 @@ class WriteSandboxPlugin(Star):
         name: str = "",
         scope: str = "work",
         work: str = "",
+        text: str = "",
     ) -> str:
         """生成/查看/删除统一格式的人设卡（全局或当前作品存储）。
 
@@ -1485,11 +1735,12 @@ class WriteSandboxPlugin(Star):
         「看看有哪些人设卡」时调用。生成后写正文时，会按大纲章节节点的出场角色自动注入人设卡。
 
         Args:
-            action(string): create=按描述生成新卡（默认）；list=列出可用卡；view=查看指定卡；update=按描述做字段级更新（只改动点名字段，其余原样保留，纯代码不走模型）；delete=删除指定卡；audit=复核当前作品人物卡（只查是否放入了无关的卡：旧卡残留/夹带无关人物）。
+            action(string): create=返回人设卡编写说明书（默认，主模型按指南写好 JSON 后用 save 提交）；save=收下主模型写好的完整人设卡 JSON（放 text 参数），结构校验后落盘；list=列出可用卡；view=查看指定卡；update=按描述做字段级更新（只改动点名字段，其余原样保留，纯代码不走模型）；delete=删除指定卡；audit=复核当前作品人物卡（只查是否放入了无关的卡：旧卡残留/夹带无关人物）。
             description(string): create 时一句话角色描述，如「夜总会老板，表面和气，背地里是情报贩子，右眼角有疤」；update 时写字段指令，如「删除称呼方式；口头禅改为 不必。」。
-            name(string): view/update/delete 时必填，角色名。
+            name(string): view/update/delete/save 时必填，角色名。
             scope(string): global=存全局（跨作品可调）；work=存当前作品（默认，仅本作品可见）。
             work(string): 可选，scope=work 时指定作品；留空沿用当前激活作品。
+            text(string): save 时必填，完整人设卡 JSON（按 action=create 返回的说明书编写）。
         """
         sandbox = self._get_sandbox(event)
         if not sandbox:
@@ -1547,7 +1798,10 @@ class WriteSandboxPlugin(Star):
                 return f"找不到角色「{name.strip()}」的旧卡，无法走纯代码更新。"
             ok, card, changes = sandbox.apply_character_edit(old, description)
             if not ok:
-                return "更新未执行：" + "；".join(changes)
+                return (
+                    "更新未执行，人家没认出要改哪些字段：\n- " + "；".join(changes)
+                    + "\n\n" + self._build_card_update_guide()
+                )
             basic = card.get("basic") if isinstance(card.get("basic"), dict) else {}
             basic["name"] = name.strip()
             card["basic"] = basic
@@ -1569,44 +1823,57 @@ class WriteSandboxPlugin(Star):
                 + extra
             )
 
-        # create：仍按描述生成新卡
+        if action == "save":
+            if not text.strip():
+                return "save 需要把人设卡 JSON 放进 text 参数（照着 action=create 返回的说明书编写）。"
+            card: Optional[dict] = None
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, dict):
+                    card = parsed
+            except Exception:
+                m = re.search(r"\{.*\}", text, re.S)
+                if m:
+                    try:
+                        parsed = json.loads(m.group(0))
+                        if isinstance(parsed, dict):
+                            card = parsed
+                    except Exception:
+                        pass
+            if card is None:
+                return "save 收到的人设卡不是合法 JSON 对象，请对照说明书重新整理后提交。"
+            basic = card.get("basic") if isinstance(card.get("basic"), dict) else {}
+            if not basic.get("name"):
+                basic["name"] = name.strip() or "未命名"
+            card["basic"] = basic
+            ok, problems = self._validate_character_card(card)
+            if not ok:
+                return (
+                    "人设卡校验未通过，打回重写：\n- " + "\n- ".join(problems)
+                    + "\n\n（对照 action=create 返回的说明书修正后，重新 save）"
+                )
+            sandbox.save_character(card, scope, active)
+            extra = ""
+            if active:
+                foreign = sandbox.check_card_foreign(card, active)
+                if foreign:
+                    extra = (
+                        "\n\n⚠️ 这张卡疑似夹带名单外人物关联（故事里未出场/未提到）："
+                        + "、".join(f"「{f}」" for f in foreign)
+                        + "\n要不要人家把卡改一下，清掉这些关联？"
+                    )
+            return f"人设卡已保存♪（{scope}）\n\n" + sandbox.render_character(card) + extra
+
+        # create：按说明书模式，返回人设卡编写指南，由主模型亲手写卡后走 save 落盘
         if not description.strip():
             return "生成人设卡需要角色描述，例如「夜总会老板，表面和气，背地里是情报贩子」。"
         reference = sandbox.render_story_memory(active)[:1500] if active else ""
-        prompt = build_character_prompt(description=description, reference=reference)
-        raw = await self._llm_chat(prompt, system_prompt="你只输出 JSON，不要输出任何其他文字。")
-        raw = self._clean(raw)
-        card: Optional[dict] = None
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                card = parsed
-        except Exception:
-            m = re.search(r"\{.*\}", raw, re.S)
-            if m:
-                try:
-                    parsed = json.loads(m.group(0))
-                    if isinstance(parsed, dict):
-                        card = parsed
-                except Exception:
-                    pass
-        if card is None:
-            return "人设卡解析失败了，请再试一次，或换个说法描述角色。"
-        basic = card.get("basic") if isinstance(card.get("basic"), dict) else {}
-        if not basic.get("name"):
-            basic["name"] = name.strip() or "未命名"
-        card["basic"] = basic
-        sandbox.save_character(card, scope, active)
-        extra = ""
-        if active:
-            foreign = sandbox.check_card_foreign(card, active)
-            if foreign:
-                extra = (
-                    "\n\n⚠️ 这张卡疑似夹带名单外人物关联（故事里未出场/未提到）："
-                    + "、".join(f"「{f}」" for f in foreign)
-                    + "\n要不要人家把卡改一下，清掉这些关联？"
-                )
-        return f"人设卡已保存♪（{scope}）\n\n" + sandbox.render_character(card) + extra
+        guide = build_character_guide(description=description, reference=reference)
+        return (
+            "【人设卡说明书】人家先把编写指南给你，你照这个格式亲手写好完整的人设卡 JSON，"
+            "然后调用 sandbox_character 的 action=save（把 JSON 放进 text 参数，name 传角色名）落盘。\n\n"
+            + guide
+        )
 
     # ═══════════════════════════════════════════
     # 工具 5.8：沙盒提炼角色（按频次/置信度自动建人设卡）
