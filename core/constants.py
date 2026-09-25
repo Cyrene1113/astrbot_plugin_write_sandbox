@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 import threading
-from typing import Any, Optional
+from typing import Any
 
 DEFAULT_CONSTRAINTS: dict[str, Any] = {
     "length": "按指令要求，未明确指定时 800~1500 字",

@@ -439,3 +439,50 @@ astrbot_plugin_write_sandbox/
 - ✅ 角色卡说明书：`sandbox_character` create 改为返回 `CHARACTER_GUIDE`；新增 `action=save`（text 传 JSON）→ `_validate_character_card` 校验 → `save_character`；update 未识别时返回字段编辑说明书。
 - ✅ 提示词：prompts.py 新增 `CHARACTER_GUIDE`/`OUTLINE_GUIDE`/`OUTLINE_REVISE_GUIDE` + build 函数；黑盒版 `build_outline_prompt`/`build_outline_revise_prompt` 已不再被 main.py 调用（定义保留）。
 - ✅ 验证：main.py/prompts.py `lint_runner` 0 问题；`load_plugin` 重载成功；校验器 7 组用例全过（合法通过/缺 name 打回/类型打回/连续通过/跳号重复空打回/diff 增删改识别）。
+
+## 12. main.py handlers 拆分（Mixin 式，2026-09-25 定稿）
+
+> 【汐小姐要求】按方案拆分 main.py（2098 行 / 103.7KB / 47 方法 / 14 工具）→ handlers/ 包。
+> 评估结论（【昔涟评估】）：方法间调用为树状/星状、无跨域环；write 域内部高内聚，其余域只共用
+> `_get_sandbox/_llm_chat/_clean` 等基础设施 → 可拆。
+> 采用 **Mixin 式**（与 core.py 拆分同套打法），放弃 10.3 早期规划的「模块级 handler 函数」——
+> Mixin 保留 self 语义、不改 llm_tool 注册方式、不动任何签名，风险最低。
+
+### 12.1 目标结构
+
+```
+main.py（→约250行）      ← @register + 类声明 + 基础设施引用 + 14 个注册壳
+handlers/
+├── __init__.py           ← 空，仅标记包
+├── base.py     BaseMixin       ← 基础设施：__init__/_get_sandbox/_llm_chat/_clean/_last_assistant_output/_build_continue_context/_apply_banned_words + PLUGIN_ID
+├── write.py    WriteMixin      ← 最肥：sandbox_write/sandbox_progress/sandbox_cancel + 24 个辅助（_run_write_job/_write_section/_notify/_plan_sections/_select_global_cards/_ensure_section_length/_strip_story_mark/_check_story_ended/_parse_* /revise 全家/_parse_edit_json/_apply_edits/_revise_repeated/_ctx/_read_target_text/_revise_text/_run_revise/_chapter_summary/_update_story_state/_extract_characters/_auto_extract_characters）
+├── outline.py  OutlineMixin    ← sandbox_outline + _validate_outline + _diff_outline_chapters
+├── character.py CharacterMixin ← sandbox_character/sandbox_extract_characters + _validate_character_card/_build_card_update_guide
+├── learn.py    LearnMixin      ← sandbox_learn/sandbox_favorite + _sample_source_text/_pack_sources
+└── misc.py     MiscMixin       ← sandbox_set/sandbox_status/sandbox_style_combo/sandbox_work/sandbox_cleanup/sandbox_reset
+```
+
+### 12.2 继承与依赖
+
+- `class WriteSandboxPlugin(BaseMixin, WriteMixin, OutlineMixin, CharacterMixin, LearnMixin, MiscMixin, Star)`，`@register` 装饰最终类留在 main.py。
+- 依赖单向无环：handlers 各自 import `core`/`prompts`/`filter`，main 只 import handlers；Mixin 之间互不 import，靠 self 共享（跨域调用如 `sandbox_extract_characters → _extract_characters` 经 MRO 天然可用）。
+- `PLUGIN_ID` 挪到 handlers/base.py，main.py 从 base 引用，避免循环导入。
+- 模块级函数 `_sample_source_text/_pack_sources` 随 learn 域迁入 learn.py。
+
+### 12.3 执行步骤
+
+1. 建 handlers/ 包 + base.py（基础设施 Mixin）
+2. write.py（最肥，拆完立刻重载冒烟）
+3. outline.py + character.py
+4. learn.py + misc.py
+5. 改 main.py：删已搬方法（AST 按 end_lineno 精确切，防漏搬多搬）、改继承、改 import
+6. 全量验证：py_compile 全部 + lint 0 问题 + load_plugin 重载 + 实调一次沙盒工具冒烟
+7. git commit（refactor: 消息）
+8. 更新本文件标记完成
+
+### 12.4 风险与对策
+
+- **AST 漏搬**：上次 core.py 拆分漏过 8 个类属性 → 脚本覆盖 Assign/AnnAssign，搬完对照 AST 核验符号齐全
+- **循环导入**：已规避（main→handlers 单向）
+- **装饰器**：`@filter.llm_tool` 随方法搬走，handlers 各自 import filter
+- **回滚**：git 基线 70aab3f 已就位，每步 safe_edit 自动备份，出问题随时回退
