@@ -19,6 +19,9 @@ class CharactersMixin:
         "说话腔调": ("speech", "tone"),
         "腔调": ("speech", "tone"),
         "口头禅": ("speech", "catchphrases"),
+        "外貌锚点": ("persona", "appearance_anchors"),
+        "示例台词": ("persona", "sample_dialogue"),
+        "语言节奏": ("persona", "speech_rhythm"),
         "别名": ("basic", "aliases"),
         "性别": ("basic", "gender"),
         "年龄": ("basic", "age"),
@@ -115,12 +118,29 @@ class CharactersMixin:
                 pass
         return None
 
+    def find_character_by_identity(self, name: str, work: str = "") -> Optional[dict]:
+        """按 canonical_id/本名/别名精确匹配查找卡（作品卡优先，回退全局）。"""
+        target = (name or "").strip()
+        if not target:
+            return None
+        from .cardops import identity_names
+        for card_name in self.list_work_characters(work) if work else []:
+            card = self.load_character(card_name, work, work_only=True)
+            if card and target in identity_names(card):
+                return card
+        for card_name in sorted(p.stem for p in self.characters_dir.glob("*.json")):
+            card = self.load_character(card_name, work)
+            if card and target in identity_names(card):
+                return card
+        return None
+
     def save_character(self, card: dict, scope: str, work: str = "") -> Path:
         """保存人设卡：scope=global 存全局目录，scope=work 存作品目录。"""
         basic = card.get("basic") if isinstance(card.get("basic"), dict) else {}
         meta = card.get("meta") if isinstance(card.get("meta"), dict) else {}
         meta["scope"] = scope
         meta["schema_version"] = CHARACTER_SCHEMA_VERSION
+        meta["canonical_id"] = str(meta.get("canonical_id") or basic.get("name") or "未命名").strip()
         meta["created_at"] = meta.get("created_at") or datetime.now().isoformat(timespec="seconds")
         if scope == "work":
             meta["work"] = work or self.get_active_work() or ""
@@ -185,7 +205,7 @@ class CharactersMixin:
                     if key == "relations":
                         sub[key] = []
                         changes.append(f"清空「{key}」（关系结构复杂，请用 view 核对后手工调整）")
-                    elif key in ("aliases", "personality", "quirks", "secrets", "plot_hooks", "catchphrases"):
+                    elif key in ("aliases", "personality", "quirks", "secrets", "plot_hooks", "catchphrases", "appearance_anchors", "sample_dialogue"):
                         vals = [v.strip() for v in re.split(r"[、,，/]", raw) if v.strip()]
                         sub[key] = vals
                         changes.append(f"设置「{key}」={vals}")
@@ -200,46 +220,83 @@ class CharactersMixin:
             return False, card, ["没有识别到任何可执行的字段指令，请用「删除X」「把X改为Y」的写法。"]
         return True, card, changes
 
-    def render_character(self, card: dict) -> str:
-        """渲染一张人设卡为文本。"""
+    def render_character(self, card: dict, purpose: str = "full") -> str:
+        """渲染一张人设卡。purpose=full 面向用户/审计（全量）；
+        purpose=write 面向写作注入：只留人物素材——
+        不渲染 secrets、relations.note、story 剧情字段，输出前再过一遍元视角剥除。"""
+        from .cardops import scrub_meta_lines
         lines: list[str] = []
         basic = card.get("basic") if isinstance(card.get("basic"), dict) else {}
         meta = card.get("meta") if isinstance(card.get("meta"), dict) else {}
-        name = basic.get("name") or meta.get("title") or "未命名"
+        persona = card.get("persona") if isinstance(card.get("persona"), dict) else {}
+        inferred = {str(x) for x in (meta.get("inferred") or [])} if purpose == "full" else set()
+
+        def _mark(path: str) -> str:
+            return "（演绎）" if path in inferred else ""
+
+        name = basic.get("name") or meta.get("canonical_id") or "未命名"
         lines.append(f"【人设卡·{name}】")
         if basic.get("aliases"):
             lines.append(f"别名：{'、'.join(str(a) for a in basic['aliases'])}")
-        for k, label in (("gender", "性别"), ("age", "年龄"), ("identity", "身份"), ("appearance", "外貌"), ("personality", "性格")):
+        for k, label in (("gender", "性别"), ("age", "年龄"), ("identity", "身份"),
+                         ("appearance", "外貌"), ("personality", "性格")):
             v = basic.get(k)
             if v:
-                lines.append(f"{label}：{v}")
+                if isinstance(v, list):
+                    v = "、".join(str(x) for x in v)
+                lines.append(f"{label}：{v}{_mark(f'basic.{k}')}")
         quirks = basic.get("quirks") or []
         if isinstance(quirks, list) and quirks:
             lines.append("习惯小动作：" + "、".join(str(q) for q in quirks))
+        # persona 段（v2 核心：写作可直接使用的正向素材）
+        anchors = persona.get("appearance_anchors") or []
+        if isinstance(anchors, list) and anchors:
+            lines.append("外貌锚点：" + "、".join(str(a) for a in anchors) + _mark("persona.appearance_anchors"))
+        dialogue_src = "示例台词"
+        dialogue = [str(d) for d in (persona.get("sample_dialogue") or []) if str(d).strip()]
+        if not dialogue:
+            # 回退档：示例台词缺失时用口头禅顶上（迁移卡立即有台词锚）
+            sp0 = card.get("speech") if isinstance(card.get("speech"), dict) else {}
+            fb = [str(p) for p in (sp0.get("catchphrases") or []) if str(p).strip()]
+            if fb:
+                dialogue_src = "示例台词（口头禅回退）"
+                dialogue = fb
+        if dialogue:
+            lines.append(f"{dialogue_src}：")
+            for d in dialogue:
+                lines.append(f"  {d}{_mark('persona.sample_dialogue')}")
+        if persona.get("speech_rhythm"):
+            lines.append(f"语言节奏：{persona['speech_rhythm']}{_mark('persona.speech_rhythm')}")
+        # background：write 模式裁剪
         bg = card.get("background") if isinstance(card.get("background"), dict) else {}
         if bg.get("origin"):
             lines.append(f"出身来历：{bg['origin']}")
         if bg.get("motivation"):
             lines.append(f"核心动机：{bg['motivation']}")
-        secrets = bg.get("secrets") or []
-        if isinstance(secrets, list) and secrets:
-            lines.append("秘密/软肋：" + "、".join(str(s) for s in secrets))
+        if purpose == "full":
+            secrets = bg.get("secrets") or []
+            if isinstance(secrets, list) and secrets:
+                lines.append("秘密/软肋：" + "、".join(str(s) for s in secrets))
         rels = bg.get("relations") or []
         if isinstance(rels, list) and rels:
             lines.append("关系：")
             for r in rels:
-                if isinstance(r, dict):
-                    parts = [str(r.get(k, "")) for k in ("name", "relation", "note") if r.get(k)]
-                    if parts:
+                if isinstance(r, dict) and str(r.get("name") or "").strip():
+                    if purpose == "full":
+                        parts = [str(r.get(k, "")) for k in ("name", "relation", "note") if r.get(k)]
                         lines.append(f"  · {'｜'.join(parts)}")
+                    else:
+                        # write：只给 name|relation，note 是剧情污染重灾区
+                        lines.append(f"  · {r.get('name')}｜{r.get('relation', '')}")
         st = card.get("story") if isinstance(card.get("story"), dict) else {}
         if st.get("role"):
             lines.append(f"定位：{st['role']}")
-        if st.get("arc"):
-            lines.append(f"人物弧线：{st['arc']}")
-        hooks = st.get("plot_hooks") or []
-        if isinstance(hooks, list) and hooks:
-            lines.append("剧情钩子：" + "、".join(str(h) for h in hooks))
+        if purpose == "full":
+            if st.get("arc"):
+                lines.append(f"人物弧线：{st['arc']}（v2 已弃用，待迁移）")
+            hooks = st.get("plot_hooks") or []
+            if isinstance(hooks, list) and hooks:
+                lines.append("剧情钩子：" + "、".join(str(h) for h in hooks) + "（v2 已弃用，待迁移）")
         if st.get("scale_role"):
             lines.append(f"涩涩参与度：{st['scale_role']}")
         sp = card.get("speech") if isinstance(card.get("speech"), dict) else {}
@@ -248,11 +305,16 @@ class CharactersMixin:
         if sp.get("address_style"):
             lines.append(f"称呼方式：{sp['address_style']}")
         cps = sp.get("catchphrases") or []
-        if isinstance(cps, list) and cps:
+        # 台词走的是口头禅回退时不再重复渲染口头禅行
+        if isinstance(cps, list) and cps and dialogue_src != "示例台词（口头禅回退）":
             lines.append("口头禅：" + "、".join(str(c) for c in cps))
-        scope_label = "全局" if meta.get("scope") != "work" else f"作品《{meta.get('work', '')}》"
-        lines.append(f"（存储：{scope_label}）")
-        return "\n".join(lines)
+        if purpose == "full":
+            scope_label = "全局" if meta.get("scope") != "work" else f"作品《{meta.get('work', '')}》"
+            lines.append(f"（存储：{scope_label}｜schema {meta.get('schema_version', '1.0')}）")
+        text = "\n".join(lines)
+        if purpose == "write":
+            text, _ = scrub_meta_lines(text)
+        return text
 
     def render_global_card_pool(self, work: str, ch: int) -> str:
         """作品卡池摘要：一行一张（名字｜身份｜核心特征），供选角判断。
@@ -310,7 +372,7 @@ class CharactersMixin:
         for n in names:
             card = self.load_character(n, work, work_only=True)
             if card:
-                lines.append(self.render_character(card))
+                lines.append(self.render_character(card, purpose="write"))
             else:
                 lines.append(f"（角色「{n}」还没有人设卡，可按上下文自由处理）")
         return "\n".join(lines)
@@ -534,3 +596,29 @@ class CharactersMixin:
         if not stale and not foreign_merged:
             lines.append("人设卡与大纲一致，没有发现无关卡混入♪")
         return "\n".join(lines)
+
+    def rename_in_outline(self, work: str, old: str, new: str) -> int:
+        """大纲里 old 角色名替换为 new（meta.characters 与各章出场名单）；返回替换处数。"""
+        if not work or old == new:
+            return 0
+        outline = self.load_outline(work)
+        n = 0
+        meta = outline.get("meta") if isinstance(outline.get("meta"), dict) else {}
+        chars = meta.get("characters")
+        if isinstance(chars, list):
+            for i, c in enumerate(chars):
+                if isinstance(c, str) and c.strip() == old:
+                    chars[i] = new
+                    n += 1
+                elif isinstance(c, dict) and str(c.get("name") or "").strip() == old:
+                    c["name"] = new
+                    n += 1
+        for it in outline.get("chapters") or []:
+            if isinstance(it, dict) and isinstance(it.get("characters"), list):
+                for i, c in enumerate(it["characters"]):
+                    if str(c).strip() == old:
+                        it["characters"][i] = new
+                        n += 1
+        if n:
+            self.save_outline(work, outline)
+        return n
