@@ -25,7 +25,7 @@
 | 风格学习 | sandbox_learn | 从 library/ + favorites/ 提炼风格卡；有激活作品则存作品级 |
 | 素材收藏 | sandbox_favorite | 收藏上一段输出，风格学习里权重最高 |
 | 大纲 | sandbox_outline | write/revise 走说明书 → save 校验 → confirm/discard；save_batch 分批收单；note 灵感便签；link 章节接续 |
-| 人设卡 | sandbox_character | create/view/update/delete/audit/save；全局/作品双存储 |
+| 人设卡 | sandbox_character | create/view/update/delete/audit/save/merge；全局/作品双存储；save 走 v2 结构+丰富度校验（主角 锚点≥3/性格≥3/台词≥2；配角各≥1；口头禅可回退台词档） |
 | 角色提炼 | sandbox_extract_characters | 从文本提炼人设卡，阈值 0.6/3，结果标注 新建/跳过/龙套 |
 | 风格组合 | sandbox_style_combo | 多卡融合 + 单维度指定来源，按激活作品隔离 |
 | 作品工作区 | sandbox_work | 作品切换/新建；action=config 调注入与提炼开关 |
@@ -55,6 +55,9 @@
 | 任务落盘断点续跑 | handlers/base.py `_scan_interrupted_jobs` + handlers/write.py `_persist_job`/`_resume_write_job` | 任务逐节写 jobs.json，重启后 sandbox_write(resume=jobN) 接续 |
 | 完稿深层清洗 | core/textclean.py | write.py 每节捕获即清洗 + misc.py action=scrub 清存量（留 .bak 备份） |
 | 大纲分批合并 | core/outlineops.py + handlers/outline.py | save_batch 每批 ≤3 章合并收单，confirm 做完整连续性校验 |
+| 卡 schema v2 与注入裁剪 | core/cardops.py + core/characters.py render_character(purpose="write") | secrets/relations.note/剧情字段不进写作上下文，示例台词必注入 |
+| 身份合并与查重 | core/characters.py find_character_by_identity + core/cardops.py merge_cards | canonical_id+本名+别名精确匹配；extract 查重与 action=merge 共用；rename_in_outline 同步大纲名单 |
+| 完稿元视角哨兵 | core/cardops.py detect_meta_sentences/scrub_meta_lines + handlers/write.py | 独立注记行自动剥除+落盘，叙述内嵌只报告进 meta_leak_report |
 
 ## 2. 功能代码导航
 
@@ -78,6 +81,7 @@ astrbot_plugin_write_sandbox/
 │   ├── style.py       ← 风格卡/组合卡/约束（含 work 作品级读写、回退全局）
 │   ├── works.py       ← 作品工作区/大纲/章节/设定书/story_config
 │   ├── characters.py  ← 人设卡全套（含字段合并 update、foreign 检测、audit）
+│   ├── cardops.py     ← 人设卡 schema v2 纯函数（normalize/validate/身份/合并/元视角检测，P1 新增）
 │   ├── library.py     ← 素材库、收藏
 │   ├── analysis.py    ← 重复检测、对话提取、白名单
 │   ├── cleanup.py     ← 过期文件清理
@@ -85,7 +89,10 @@ astrbot_plugin_write_sandbox/
 │   ├── textclean.py   ← 完稿深层清洗（分节标题/状态标记/注记行剥离）
 │   └── outlineops.py  ← 大纲分批合并与结构校验
 ├── tests/
-│   └── test_p0.py     ← P0 纯函数单测（python tests/test_p0.py，无需依赖）
+│   ├── test_p0.py     ← P0 纯函数单测（python tests/test_p0.py，无需依赖）
+│   └── test_p1.py     ← P1 纯函数+Sandbox 级单测（cardops schema v2/合并/元视角，python tests/test_p1.py，无需依赖）
+├── scripts/
+│   └── migrate_v1_v2.py ← 存量卡 v1→v2 迁移（默认 dry-run 只出报告，--apply 实迁留 .bak_v1；报告 migration_report.md 已 gitignore）
 ├── _conf_schema.yaml  ← 引擎参数配置（注入 BaseMixin._ENGINE）
 ├── prompts.py         ← 提示词模板 + 三份说明书
 ├── metadata.yaml
@@ -100,6 +107,7 @@ astrbot_plugin_write_sandbox/
 | 写作全链路/注入开关/提炼 | handlers/write.py | 冒烟：短篇 generate/continue/revise + 长文开关组合 |
 | 大纲/接续/便签 | handlers/outline.py + core/works.py | 说明书 → save 校验 → confirm 链路走通 |
 | 人设卡 | handlers/character.py + core/characters.py | create→save 校验→view/update/audit 各走一遍 |
+| 人设卡 schema/注入裁剪/合并 | core/cardops.py + core/characters.py + handlers/character.py | python tests/test_p1.py + 迁移 dry-run |
 | 风格卡/组合/约束 | core/style.py + handlers/learn.py + misc.py | 学习→状态→组合 set/clear，验证作品回退全局 |
 | 作品工作区/摘要/设定书 | core/works.py | 长文写章→摘要追加→设定书覆盖 |
 | LLM 调用/超时/任务续跑 | handlers/base.py + handlers/write.py + core/llmerrors.py | python tests/test_p0.py + py_compile |
@@ -114,10 +122,11 @@ astrbot_plugin_write_sandbox/
 
 ## 4. 最近改动小尾巴
 
-1. 2026-10-24 P0 稳定性改造【汐小姐要求】：_llm_chat 流式化+空闲超时+错误分类（超时/限流/上下文超限可辨）、引擎参数配置化（每节 4000→2000）、大纲 save_batch 分批收单+confirm 严格校验、写作任务 jobs.json 落盘+resume 断点续跑、完稿深层清洗（分节标题/状态标记/注记行剥离，存量走 sandbox_cleanup scrub），新增 core/llmerrors.py、core/textclean.py、core/outlineops.py、tests/test_p0.py、_conf_schema.yaml，版本 0.3.0
-2. 2026-09-27 修复口水词哨兵失效【汐小姐要求】：core/analysis.py `_extract_dialogues`、core/library.py `_read_sources`/`_read_texts` 三个方法在模块化拆分后丢失 `@staticmethod` 装饰器（无 self 亦无装饰器），经 `self.xxx()` 实例调用即 TypeError，且被 write.py 的 try/except 静默吞掉，导致完稿哨兵「检测+自动修订」整条链路不生效。补回 `@staticmethod` 后恢复；已对 Sandbox 全方法做签名级体检 + 全域冒烟通过。
-3. 2026-09-25 风格卡作品级绑定 + 注入/提炼三开关（inject_memory/inject_characters/auto_extract）+ 角色卡提取收紧 0.6/3
-4. 2026-09-25 main.py → handlers/ 包拆分（Mixin 式，56c205b）
-5. 2026-09-21 局部修改优化：正文 mode=revise + 角色卡/大纲说明书模式
-6. 2026-09-21 core.py → core/ 包拆分（Mixin 式）
-7. 2026-09-13 写作体验小部件：章节接续 / 废稿清理 / 口水词哨兵 / 灵感便签
+1. 2026-10-24 P1 角色卡 schema v2 与剧情解耦【汐小姐要求】：卡 schema v2（persona 段+示例台词+inferred 演绎标注+canonical_id）、剧情退出人设卡（arc/plot_hooks 迁设定书）、写作注入裁剪（secrets/relations.note/剧情字段不进写作上下文，示例台词必注入）、完稿元视角哨兵（独立注记行自动剥除+落盘，叙述内嵌只报告进 meta_leak_report）、sandbox_character action=merge 身份合并（别名吸收/空位互补/大纲出场名单同步）、存量卡迁移脚本 scripts/migrate_v1_v2.py（默认 dry-run 只出报告、--apply 实迁且源卡留 .bak_v1 备份，全局卡剧情字段进 migration_dropped.json），新增 core/cardops.py、tests/test_p1.py，版本 0.4.0
+2. 2026-10-24 P0 稳定性改造【汐小姐要求】：_llm_chat 流式化+空闲超时+错误分类（超时/限流/上下文超限可辨）、引擎参数配置化（每节 4000→2000）、大纲 save_batch 分批收单+confirm 严格校验、写作任务 jobs.json 落盘+resume 断点续跑、完稿深层清洗（分节标题/状态标记/注记行剥离，存量走 sandbox_cleanup scrub），新增 core/llmerrors.py、core/textclean.py、core/outlineops.py、tests/test_p0.py、_conf_schema.yaml，版本 0.3.0
+3. 2026-09-27 修复口水词哨兵失效【汐小姐要求】：core/analysis.py `_extract_dialogues`、core/library.py `_read_sources`/`_read_texts` 三个方法在模块化拆分后丢失 `@staticmethod` 装饰器（无 self 亦无装饰器），经 `self.xxx()` 实例调用即 TypeError，且被 write.py 的 try/except 静默吞掉，导致完稿哨兵「检测+自动修订」整条链路不生效。补回 `@staticmethod` 后恢复；已对 Sandbox 全方法做签名级体检 + 全域冒烟通过。
+4. 2026-09-25 风格卡作品级绑定 + 注入/提炼三开关（inject_memory/inject_characters/auto_extract）+ 角色卡提取收紧 0.6/3
+5. 2026-09-25 main.py → handlers/ 包拆分（Mixin 式，56c205b）
+6. 2026-09-21 局部修改优化：正文 mode=revise + 角色卡/大纲说明书模式
+7. 2026-09-21 core.py → core/ 包拆分（Mixin 式）
+8. 2026-09-13 写作体验小部件：章节接续 / 废稿清理 / 口水词哨兵 / 灵感便签

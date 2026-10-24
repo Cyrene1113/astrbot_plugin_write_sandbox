@@ -38,6 +38,8 @@
 | 写《XX》第 3 章 | 进入长篇模式，自动维护章节摘要和设定书 |
 | 给《XX》定个大纲 | 规划全局脉络 + 分章节点，写作时自动注入；章节多时自动分批提交 |
 | 给配角也设个卡 | 生成统一格式人设卡，写正文时按出场角色自动注入 |
+| 同一角色有两张卡 → 说「把 A 并进 B」 | 合并重复卡：别名吸收、空位互补、大纲出场名单同步替换（sandbox_character merge） |
+| 人设卡残留剧情安排？ | 写正文时自动只注入人物素材（秘密/剧情字段/关系备注不进正文上下文），完稿还会扫作者视角残留 |
 | 看看沙盒现在是什么设置 | 查看当前风格卡与约束 |
 | 写到哪了 / 后台好了吗 | 查看后台写作进度 |
 | 写到一半重启了，说继续上次写作 | 从断点继续，已写内容保留 |
@@ -81,6 +83,31 @@
 - 素材放 `library/`（txt / md），收藏的样本自动优先
 - 多张风格卡可以**组合**：设一张底卡，再按维度指定来源（比如「句式用 A 卡、尺度用 B 卡」）
 
+## 🎭 人设卡 v2：教「人是谁」，不管「剧情往哪走」
+
+人设卡和剧情彻底分家，卡里只放写正文用得上的「人物素材」：
+
+- **persona 段（v2 新增）**：外貌锚点、示例台词 2~3 句、语言节奏——其中**示例台词是锚定角色腔调最有效的手段**，优先填满
+- **canon 与 inferred**：演绎补足（原设定里没有、推出来）的字段登记在 meta.inferred，渲染时标「（演绎）」，设定与推测一眼分清
+- **剧情退出人设卡**：人物弧线、剧情钩子归大纲与设定书管，卡里不再存
+- **丰富度硬线**：主角卡要求外貌锚点≥3 / 性格≥3 / 示例台词≥2，配角各≥1——缺了 save 时会被打回，并列出缺项
+
+## 🔄 存量卡迁移到 v2
+
+插件升级到 0.4.0 后，老版本（v1）人设卡跑一次迁移脚本就能升级，不用手动改：
+
+```bash
+# 第一步：dry-run，只出迁移报告，不动任何卡
+python scripts/migrate_v1_v2.py --data-root data/plugin_data/astrbot_plugin_write_sandbox
+
+# 第二步：看完报告、确认没问题后，加 --apply 实际迁移
+python scripts/migrate_v1_v2.py --apply --data-root data/plugin_data/astrbot_plugin_write_sandbox
+```
+
+- 默认 dry-run 只出报告不落盘，**apply 前先看 dry-run 报告并自行确认**
+- apply 时每张源卡自动留一份 `.bak_v1` 备份，随时可回退
+- 全局卡的剧情字段（搬不进设定书的）会存进 `migration_dropped.json`，不丢数据，去留由你定
+
 ## 📚 长篇作品工作区
 
 - 每篇作品独立维护：逐章摘要 + 设定书 + 大纲
@@ -98,8 +125,10 @@
 astrbot_plugin_write_sandbox/
 ├── main.py            # AstrBot 入口与工具注册
 ├── handlers/          # 业务逻辑（6 个 Mixin：base / write / outline / character / learn / misc）
-├── core/              # 沙盒核心包（analysis / characters / cleanup / constants / library / llmerrors / outlineops / sandbox / storage / style / textclean / works）
+├── core/              # 沙盒核心包（analysis / cardops / characters / cleanup / constants / library / llmerrors / outlineops / sandbox / storage / style / textclean / works）
 ├── prompts.py         # 提示词模板
+├── scripts/
+│   └── migrate_v1_v2.py  # 存量人设卡 v1→v2 迁移（默认 dry-run 只出报告，--apply 实迁，见「🔄 存量卡迁移到 v2」）
 ├── tests/
 │   └── test_p0.py     # P0 稳定性单测（python tests/test_p0.py 直接跑，无需装依赖）
 ├── _conf_schema.yaml  # 引擎参数配置（WebUI 插件配置页可见，见上文「⚙️ 引擎配置」）
