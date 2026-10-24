@@ -1,0 +1,24 @@
+section_target_chars:
+  type: int
+  default: 2000
+  description: 每节目标字数（4000 下调而来，单次生成越短超时概率越低）
+max_sections:
+  type: int
+  default: 30
+  description: 单次任务最多分节数
+section_retry:
+  type: int
+  default: 2
+  description: 单节失败额外重试次数
+stream_first:
+  type: bool
+  default: true
+  description: LLM 调用优先流式（按空闲判超时，慢而正常的生成不再被误杀；出问题可关闭回退旧模式）
+stream_idle_timeout:
+  type: int
+  default: 60
+  description: 流式空闲超时秒数（连续这么久没有任何新内容才判死）
+llm_total_timeout:
+  type: int
+  default: 300
+  description: 单次 LLM 调用总超时上限秒数（非流式模式下即整体超时）
