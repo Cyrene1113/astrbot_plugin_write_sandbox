@@ -117,12 +117,14 @@ astrbot_plugin_write_sandbox/
 
 | 任务 | 内容 | 验收标准 |
 |------|------|---------|
+| P2 约束与提示词（评估方案 §四 P2） | 约束三层（全局/作品/章节）、系统提示词瘦身 ≥40%、校验-修订闭环（代词密度/段尾升华/元信息，复用哨兵机制）、风格卡示例段 few-shot 注入 | 哨兵报告可见各检查项并自动修订；系统提示词 token 对比数据；constraints 无跨作品剧情内容 |
+| P3 长文质量（评估方案 §四 P3） | 章→场景 beat 细纲、大纲动态修订（DOC 式）、摘要分层（近 3 章详摘+弧线压缩）、per-character 当前状态、注入 token 预算 | 10 章以上连载人设/伏笔一致性可查；百章级作品注入上下文规模稳定 |
 | 素材动态检索（二期） | 素材量大后切块向量化入 knowledge_base，按主题检索 few-shot（原第 5 节方式B） | 素材量触发后风格仍稳定、省 token |
 | 上百章早期弧线归档 | 已完结早期弧线的摘要一次性归档，只归档一次不进循环（原 9.1 扩展点） | 上百章长文上下文不爆，旧弧线信息不丢 |
 
 ## 4. 最近改动小尾巴
 
-1. 2026-10-24 P1 角色卡 schema v2 与剧情解耦【汐小姐要求】：卡 schema v2（persona 段+示例台词+inferred 演绎标注+canonical_id）、剧情退出人设卡（arc/plot_hooks 迁设定书）、写作注入裁剪（secrets/relations.note/剧情字段不进写作上下文，示例台词必注入）、完稿元视角哨兵（独立注记行自动剥除+落盘，叙述内嵌只报告进 meta_leak_report）、sandbox_character action=merge 身份合并（别名吸收/空位互补/大纲出场名单同步）、存量卡迁移脚本 scripts/migrate_v1_v2.py（默认 dry-run 只出报告、--apply 实迁且源卡留 .bak_v1 备份，全局卡剧情字段进 migration_dropped.json），新增 core/cardops.py、tests/test_p1.py，版本 0.4.0
+1. 2026-10-24 P1 角色卡 schema v2 与剧情解耦【汐小姐要求】：卡 schema v2（persona 段+示例台词+inferred 演绎标注+canonical_id）、剧情退出人设卡（arc/plot_hooks 迁设定书）、写作注入裁剪（secrets/relations.note/剧情字段不进写作上下文，示例台词必注入）、完稿元视角哨兵（独立注记行自动剥除+落盘，叙述内嵌只报告进 meta_leak_report）、sandbox_character action=merge 身份合并（别名吸收/空位互补/大纲出场名单同步）、存量卡迁移脚本 scripts/migrate_v1_v2.py（默认 dry-run 只出报告、--apply 实迁且源卡留 .bak_v1 备份，全局卡剧情字段进 migration_dropped.json），新增 core/cardops.py、tests/test_p1.py，版本 0.4.0。【补记】同日 --apply 已执行：16 卡全部 v2（备份 *.json.bak_v1）、设定书收编 10 arc+23 伏笔、两张汐卡 role 章号残留已清；备份命名后缀在后防 glob 污染（95352cc）；P0/P1 均已快进合并 main（未 push），真机冒烟与 merge 汐双卡待跑
 2. 2026-10-24 P0 稳定性改造【汐小姐要求】：_llm_chat 流式化+空闲超时+错误分类（超时/限流/上下文超限可辨）、引擎参数配置化（每节 4000→2000）、大纲 save_batch 分批收单+confirm 严格校验、写作任务 jobs.json 落盘+resume 断点续跑、完稿深层清洗（分节标题/状态标记/注记行剥离，存量走 sandbox_cleanup scrub），新增 core/llmerrors.py、core/textclean.py、core/outlineops.py、tests/test_p0.py、_conf_schema.yaml，版本 0.3.0
 3. 2026-09-27 修复口水词哨兵失效【汐小姐要求】：core/analysis.py `_extract_dialogues`、core/library.py `_read_sources`/`_read_texts` 三个方法在模块化拆分后丢失 `@staticmethod` 装饰器（无 self 亦无装饰器），经 `self.xxx()` 实例调用即 TypeError，且被 write.py 的 try/except 静默吞掉，导致完稿哨兵「检测+自动修订」整条链路不生效。补回 `@staticmethod` 后恢复；已对 Sandbox 全方法做签名级体检 + 全域冒烟通过。
 4. 2026-09-25 风格卡作品级绑定 + 注入/提炼三开关（inject_memory/inject_characters/auto_extract）+ 角色卡提取收紧 0.6/3
