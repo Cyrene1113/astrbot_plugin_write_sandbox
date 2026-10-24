@@ -25,6 +25,7 @@ class CharacterMixin:
         scope: str = "work",
         work: str = "",
         text: str = "",
+        merge_from: str = "",
     ) -> str:
         """生成/查看/删除统一格式的人设卡（全局或当前作品存储）。
 
@@ -32,12 +33,13 @@ class CharacterMixin:
         「看看有哪些人设卡」时调用。生成后写正文时，会按大纲章节节点的出场角色自动注入人设卡。
 
         Args:
-            action(string): create=返回人设卡编写说明书（默认，主模型按指南写好 JSON 后用 save 提交）；save=收下主模型写好的完整人设卡 JSON（放 text 参数），结构校验后落盘；list=列出可用卡；view=查看指定卡；update=按描述做字段级更新（只改动点名字段，其余原样保留，纯代码不走模型）；delete=删除指定卡；audit=复核当前作品人物卡（只查是否放入了无关的卡：旧卡残留/夹带无关人物）。
+            action(string): create=返回人设卡编写说明书（默认，主模型按指南写好 JSON 后用 save 提交）；save=收下主模型写好的完整人设卡 JSON（放 text 参数），结构校验后落盘；list=列出可用卡；view=查看指定卡；update=按描述做字段级更新（只改动点名字段，其余原样保留，纯代码不走模型）；delete=删除指定卡；audit=复核当前作品人物卡（只查是否放入了无关的卡：旧卡残留/夹带无关人物）；merge=合并重复卡（name=保留卡，merge_from=被并入卡）。
             description(string): create 时一句话角色描述，如「夜总会老板，表面和气，背地里是情报贩子，右眼角有疤」；update 时写字段指令，如「删除称呼方式；口头禅改为 不必。」。
             name(string): view/update/delete/save 时必填，角色名。
             scope(string): global=存全局（跨作品可调）；work=存当前作品（默认，仅本作品可见）。
             work(string): 可选，scope=work 时指定作品；留空沿用当前激活作品。
             text(string): save 时必填，完整人设卡 JSON（按 action=create 返回的说明书编写）。
+            merge_from(string): merge 时必填，被并入的卡名（如 水瓶座小姐（汐））；name 传保留的卡。
         """
         sandbox = self._get_sandbox(event)
         if not sandbox:
@@ -78,6 +80,33 @@ class CharacterMixin:
             if sandbox.delete_character(name.strip(), scope, active):
                 return f"已删除人设卡「{name.strip()}」（{scope}）♪"
             return f"没有找到可删除的「{name.strip()}」（{scope}）。"
+
+        if action == "merge":
+            if not name.strip() or not merge_from.strip():
+                return "merge 需要 name=保留的卡 与 merge_from=被并入的卡（如 name=汐, merge_from=水瓶座小姐（汐））。"
+            if name.strip() == merge_from.strip():
+                return "两张卡不能同名。"
+            primary = sandbox.load_character(name.strip(), active)
+            secondary = sandbox.load_character(merge_from.strip(), active)
+            if not primary or not secondary:
+                return (
+                    f"两张卡都要存在才能合并（{name.strip()}={'有' if primary else '无'}，"
+                    f"{merge_from.strip()}={'有' if secondary else '无'}）。"
+                )
+            from ..core.cardops import merge_cards, normalize_card
+            primary, _ = normalize_card(primary)
+            secondary, _ = normalize_card(secondary)
+            merged = merge_cards(primary, secondary)
+            scope_saved = "work" if (merged.get("meta") or {}).get("scope") == "work" else "global"
+            sandbox.save_character(merged, scope_saved, active)
+            sandbox.delete_character(merge_from.strip(), scope_saved, active)
+            # 大纲出场名单同步替换（源名 → 保留名）
+            replaced = sandbox.rename_in_outline(active, merge_from.strip(), name.strip())
+            note = f"；大纲出场名单已替换 {replaced} 处" if replaced else ""
+            return (
+                f"已把「{merge_from.strip()}」并入「{name.strip()}」♪（别名吸收、空位互补{note}）\n\n"
+                + sandbox.render_character(merged)
+            )
 
         if action == "audit":
             if not active:
@@ -143,7 +172,8 @@ class CharacterMixin:
             if not basic.get("name"):
                 basic["name"] = name.strip() or "未命名"
             card["basic"] = basic
-            ok, problems = self._validate_character_card(card)
+            from ..core.cardops import validate_card_v2
+            ok, problems = validate_card_v2(card)
             if not ok:
                 return (
                     "人设卡校验未通过，打回重写：\n- " + "\n- ".join(problems)
@@ -268,7 +298,7 @@ class CharacterMixin:
         suspect_cards: list[str] = []
         for c in passed:
             nm = str(c.get("name") or "").strip() or "未命名"
-            if sandbox.load_character(nm, active):
+            if sandbox.find_character_by_identity(nm, active):
                 skipped.append(nm)
                 continue
             role_hint = str(c.get("role_hint") or "配角")
@@ -317,7 +347,8 @@ class CharacterMixin:
 
     @staticmethod
     def _validate_character_card(card: dict) -> tuple[bool, list[str]]:
-        """人设卡结构校验：段必须是对象、列表字段必须是数组、relations 每项必须有 name。
+        """（deprecated：save 已改用 cardops.validate_card_v2，本方法留作旧路径安全网）
+        人设卡结构校验：段必须是对象、列表字段必须是数组、relations 每项必须有 name。
         返回 (是否通过, 问题列表)。"""
         problems: list[str] = []
         if not isinstance(card, dict):
@@ -356,7 +387,7 @@ class CharacterMixin:
         """人设卡字段编辑说明书：update 识别不了自然语言时，指引主模型如何组织指令或改用 save 提交。"""
         return (
             "【字段编辑说明书】update 是纯代码字段合并，只认严格指令，建议这样组织：\n"
-            "可用字段：称呼方式、说话腔调/腔调、口头禅、别名、性别、年龄、身份、外貌、性格、"
+            "可用字段：称呼方式、说话腔调/腔调、口头禅、外貌锚点、示例台词、语言节奏、别名、性别、年龄、身份、外貌、性格、"
             "习惯小动作/小动作、出身来历/出身、核心动机/动机、秘密/软肋、关系、定位、人物弧线、"
             "剧情钩子、涩涩参与度/尺度。\n"
             "指令写法：\n"
