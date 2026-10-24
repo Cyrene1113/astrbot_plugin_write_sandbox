@@ -15,6 +15,8 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import Plain
 
 from ..core import Sandbox
+from ..core.llmerrors import LLMCallError
+from ..core.textclean import deep_clean_sections
 from ..prompts import (
     build_chapter_summary_prompt,
     build_character_extract_prompt,
@@ -44,6 +46,7 @@ class WriteMixin:
         tag: str = "",
         work: str = "",
         chapter: int = 0,
+        resume: str = "",
     ) -> str:
         """在独立写作沙盒中后台分节生成文字，任务开始即返回，全部写完会自动把完整文件推给用户。
 
@@ -53,7 +56,7 @@ class WriteMixin:
         用 mode=revise，只精确改动点名位置，不整篇推翻。
         长篇模式：用户提到作品名（如「写《雾都夜行》第3章」）时把作品名传入 work，
         正文会存进该作品的章节目录，并自动生成章节摘要、更新设定书。
-        长文会自动分成每节约 4000 字的小节在后台逐节写；用户中途问进度时调用 sandbox_progress 工具。
+        长文会自动分成每节约 2000 字（可配置）的小节在后台逐节写；用户中途问进度时调用 sandbox_progress 工具。
         重写指定章节时（如「重写第8章」）：mode=rewrite 且传入 chapter=8，写完后会覆盖该章原文件，
         不会新增章节号。
 
@@ -63,10 +66,13 @@ class WriteMixin:
             tag(string): 可选，给这段文字起个名字，会用在文件名上。
             work(string): 可选，长篇作品名。传入则切换/新建该作品工作区；留空沿用当前激活作品。
             chapter(int): 可选，目标章节号。rewrite 指定章节（如重写第8章→8）或 generate 指定位置时用；0=自动判断。
+            resume(string): 可选，断点续跑：传上次中断的任务号（如 job3），从断点继续写，已写内容保留。
         """
         sandbox = self._get_sandbox(event)
         if not sandbox:
             return "找不到沙盒（无法识别发送者）。"
+        if resume.strip():
+            return await self._resume_write_job(event, resume.strip())
         uid = str(event.get_sender_id())
 
         # 作品工作区：传入作品名则切换，否则沿用当前激活作品
@@ -169,6 +175,24 @@ class WriteMixin:
             lines.append(f"错误：{job['error']}")
         return "\n".join(lines)
 
+    def _persist_job(self, job: dict, status: Optional[str] = None) -> None:
+        """任务状态落盘（每用户一条，覆盖写）。已写正文不落这里——作品读草稿、短篇读 outputs 文件。"""
+        if status:
+            job["status"] = status
+        rec = {k: job.get(k) for k in (
+            "job_id", "uid", "session", "mode", "instruction", "tag", "work",
+            "chapter_no", "section_idx", "section_total", "file_path",
+            "error", "started_at", "status",
+        )}
+        rec["target_chars"] = job.get("_target_chars", 0) or 0  # _plan_sections 写在 _target_chars
+        rec["updated_at"] = time.time()
+        try:
+            p = self._jobs_file(job["uid"])
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(rec, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as e:
+            logger.warning(f"[沙盒] 任务状态落盘失败: {e}")
+
     @classmethod
     def _parse_chapter_no(cls, text: str) -> int:
         """从「重写第8章」「第八章」「第 12 章」等指令里解析目标章号；解析不到返回 0。"""
@@ -243,7 +267,7 @@ class WriteMixin:
         return 0
 
     def _plan_sections(self, job: dict) -> int:
-        """估算起始分节数。有明确字数按字数拆（每节约4000字）；无明确字数从1节起步，由剧情驱动动态续写。"""
+        """估算起始分节数。有明确字数按字数拆（每节约 2000 字（可配置））；无明确字数从1节起步，由剧情驱动动态续写。"""
         instruction = job["instruction"]
         length_cfg = str((job["sandbox"].constraints or {}).get("length", ""))
         target = self._parse_target_chars(f"{instruction}\n{length_cfg}")
@@ -254,6 +278,62 @@ class WriteMixin:
         # 无明确字数：不预设节数，每节写完由剧情是否收尾决定是否新增下一节
         return 1
 
+    async def _resume_write_job(self, event: AstrMessageEvent, job_id: str) -> str:
+        """从持久化记录恢复中断/失败的任务：已写内容整体作为前文，从下一节继续。"""
+        sandbox = self._get_sandbox(event)
+        if not sandbox:
+            return "找不到沙盒（无法识别发送者）。"
+        uid = str(event.get_sender_id())
+        rec = self._load_persisted_job(uid)
+        if not rec or rec.get("job_id") != job_id:
+            return f"找不到可恢复的任务 {job_id}（每用户只保留最近一条任务记录）。"
+        if rec.get("status") not in ("interrupted", "failed"):
+            return f"任务 {job_id} 当前状态是「{rec.get('status')}」，不需要恢复。"
+        old = self._jobs.get(uid)
+        if old and old.get("status") in ("pending", "running"):
+            return "当前已有进行中的写作任务，等它完成或先取消再恢复旧任务。"
+        parts_text = ""
+        if rec.get("work"):
+            parts_text = sandbox.read_draft(rec["work"], job_id)
+        if not parts_text and rec.get("file_path") and Path(rec["file_path"]).exists():
+            try:
+                parts_text = Path(rec["file_path"]).read_text(encoding="utf-8")
+            except Exception:
+                parts_text = ""
+        if not parts_text.strip():
+            return f"任务 {job_id} 没有已落盘的内容可续，直接重新开写吧。"
+
+        self._job_seq += 1
+        job = {
+            "job_id": job_id,  # 沿用旧任务号：作品草稿按 job_id 命名，续写要接着同一份草稿
+            "uid": uid,
+            "session": event.unified_msg_origin,
+            "mode": rec.get("mode") or "generate",
+            "instruction": rec.get("instruction") or "",
+            "tag": rec.get("tag") or "",
+            "work": rec.get("work") or "",
+            "chapter_no": int(rec.get("chapter_no") or 0),
+            "sandbox": sandbox,
+            "status": "pending",
+            "section_idx": int(rec.get("section_idx") or 0),
+            "section_total": int(rec.get("section_total") or 0),
+            "current_chunk": "",
+            "file_path": rec.get("file_path") or "",
+            "error": "",
+            "started_at": time.time(),
+            "finished_at": 0.0,
+            "resume_parts": [parts_text],
+            "resume_from": int(rec.get("section_idx") or 0),
+            "resume_total": int(rec.get("section_total") or 0),
+            "_target_chars": int(rec.get("target_chars") or 0),
+        }
+        self._jobs[uid] = job
+        job["task"] = asyncio.create_task(self._run_write_job(job))
+        return (
+            f"【已恢复任务 {job_id}♪】从第 {job['resume_from'] + 1} 节继续，"
+            f"已写内容（约 {len(parts_text)} 字）会接在成品里，写完自动推送。"
+        )
+
     async def _run_write_job(self, job: dict) -> None:
         """后台主循环：逐节生成 → 逐节落盘 → 全部完成后更新记忆并通知。"""
         sandbox: Sandbox = job["sandbox"]
@@ -262,8 +342,10 @@ class WriteMixin:
         tag = job["tag"]
         ch = job["chapter_no"]
         mode = job.get("mode") or "generate"
+        resume_parts: list[str] = list(job.pop("resume_parts", None) or [])
+        start_idx = int(job.pop("resume_from", 0) or 0) + 1
         try:
-            total = self._plan_sections(job)
+            total = int(job.pop("resume_total", 0) or 0) or self._plan_sections(job)
             job["section_total"] = total
             job["status"] = "running"
             # 作品级注入开关：inject_memory=摘要+设定书，inject_characters=人设卡+选角
@@ -287,15 +369,20 @@ class WriteMixin:
                         story_context = (story_context + "\n\n" + picked) if story_context else picked
                 except Exception as e:
                     logger.warning(f"全局卡智能选角失败，跳过: {e}")
-            parts_written: list[str] = []
+            parts_written: list[str] = resume_parts
             file_path = None
 
-            i = 1
+            i = start_idx
             while True:
                 chunk, ended_mark = await self._write_section(job, i, total, parts_written, story_context)
                 if chunk is None:
                     job["status"] = "failed"
-                    job["error"] = f"第 {i} 节连续生成失败（已重试 {self._SECTION_RETRY} 次）"
+                    if not job.get("error"):
+                        job["error"] = (
+                            f"第 {i} 节连续生成失败（已重试 {self._SECTION_RETRY} 次）"
+                            f"：{job.get('last_error', '未知错误')}"
+                        )
+                    self._persist_job(job)
                     await self._notify(job, failed=True)
                     return
                 job["current_chunk"] = chunk
@@ -310,6 +397,7 @@ class WriteMixin:
                 sandbox.append_history("assistant", chunk)
                 parts_written.append(chunk)
                 job["section_idx"] = i
+                self._persist_job(job)
                 # 剧情驱动：每节写完判断是否自然收尾；收尾或触顶即停，否则自动新增一节
                 if ended_mark is None:
                     ended_mark = await self._check_story_ended(job, chunk)
@@ -336,8 +424,11 @@ class WriteMixin:
                 summary = await self._chapter_summary(full)
                 if not summary:
                     summary = full[:200]
+                    job.setdefault("post_warnings", []).append("章节摘要生成失败，已用正文前 200 字兜底")
                 sandbox.upsert_chapter_summary(work, final_ch, summary)
-                await self._update_story_state(sandbox, work, full, final_ch)
+                state_msg = await self._update_story_state(sandbox, work, full, final_ch)
+                if "失败" in state_msg:
+                    job.setdefault("post_warnings", []).append(state_msg)
                 # 自动提炼人设卡：受作品级 auto_extract 开关控制（默认关）
                 # 开启后只给「多章累计反复出现」的角色建卡，单章一次性龙套跳过
                 if sandbox.load_story_config(work).get("auto_extract", False):
@@ -349,6 +440,7 @@ class WriteMixin:
                         logger.warning(f"自动提炼人设卡失败: {e}")
 
             job["status"] = "done"
+            self._persist_job(job)
             # 口水词小哨兵：整章/整段完成后自动扫一遍重复词，随通知附上；
             # 检出问题时交给 LLM 判断并做「一轮」自动修订（防无限返工，不再二次检查）
             try:
@@ -382,10 +474,15 @@ class WriteMixin:
             logger.error(f"后台写作任务 {job.get('job_id')} 异常: {e}")
             job["status"] = "failed"
             job["error"] = str(e)
+            self._persist_job(job)
             try:
                 await self._notify(job, failed=True)
             except Exception:
                 pass
+        except asyncio.CancelledError:
+            job["status"] = "cancelled"
+            self._persist_job(job)
+            raise
         finally:
             job["finished_at"] = time.time()
 
@@ -529,11 +626,24 @@ class WriteMixin:
                 f"继续要求：{instruction}\n{section_note}"
             )
 
+        last_err = ""
         for attempt in range(self._SECTION_RETRY + 1):
             if attempt:
-                logger.warning(f"写作沙盒第 {idx} 节第 {attempt} 次重试")
+                logger.warning(f"写作沙盒第 {idx} 节第 {attempt} 次重试（上次失败：{last_err or '未知'}）")
+            text, err = await self._llm_chat_ex(prompt, system_prompt=system_prompt)
+            if err is not None:
+                last_err = str(err)
+                job["last_error"] = last_err
+                if err.kind == LLMCallError.CONTEXT_OVERFLOW:
+                    # 重试无意义：直接终止任务，给出可操作建议
+                    job["error"] = f"第 {idx} 节生成中止：{err}。可尝试 sandbox_work 关闭 inject_memory/inject_characters，或压缩设定书"
+                    return None, None
+                if err.kind == LLMCallError.RATE_LIMIT and attempt < self._SECTION_RETRY:
+                    await asyncio.sleep(min(30, 5 * (attempt + 1)))  # 限流退避 5s/10s
+                    continue
                 await asyncio.sleep(1)
-            raw = await self._llm_chat(prompt, system_prompt=system_prompt)
+                continue
+            raw = text
             text = self._clean(raw)
             if text:
                 text = self._apply_banned_words(text, sandbox)
@@ -546,6 +656,7 @@ class WriteMixin:
                     text, m2 = self._strip_story_mark(text)
                     if m2 is not None:
                         ended_mark = m2
+                text = deep_clean_sections(text)  # T7：每节捕获即清洗，防止分节标题混进正文
                 if text.strip():
                     return text, ended_mark
         return None, None
@@ -631,7 +742,10 @@ class WriteMixin:
             "请判断故事到这里是否已经自然收尾"
             "（情节完整落幕、没有明显未交代的走向）。只回答两个字：是 或 否。"
         )
-        raw = await self._llm_chat(prompt, timeout=60.0)
+        raw, err = await self._llm_chat_ex(prompt, timeout=60.0)
+        if err is not None:
+            logger.warning(f"[沙盒] 收尾判断调用失败（{err}），按未收尾处理")
+            return False
         return "是" in (raw or "")[:20]
 
     async def _notify(self, job: dict, failed: bool) -> None:
@@ -663,6 +777,8 @@ class WriteMixin:
                     body += f"\n\n【口水词小哨兵·自动修订】{job['revise_report']}"
                     if job.get("revise_path"):
                         body += f"\n修订版另存：{job['revise_path']}"
+                for w in job.get("post_warnings") or []:
+                    body += f"\n⚠️ {w}"
                 chunk = job.get("current_chunk") or ""
                 if chunk:
                     body += "\n\n【末尾节选】\n" + chunk[-400:]
@@ -874,6 +990,14 @@ class WriteMixin:
         uid = str(event.get_sender_id())
         job = self._jobs.get(uid)
         if not job:
+            # 内存里没有任务时，查持久化记录：上次任务可能被重启中断
+            rec = self._load_persisted_job(uid)
+            if rec and rec.get("status") == "interrupted":
+                return (
+                    f"上一个写作任务 {rec.get('job_id')}（{rec.get('work') or '短篇'}）在第 "
+                    f"{rec.get('section_idx')} 节后被重启中断，已写内容保留在：{rec.get('file_path')}\n"
+                    f"要继续就调用 sandbox_write 并传 resume={rec.get('job_id')}；要重写就直接下新指令。"
+                )
             return "当前没有后台写作任务。直接说「写一段……」让人家开一个♪"
         return self._render_job_status(job)
 
@@ -901,6 +1025,7 @@ class WriteMixin:
             return f"任务 {job.get('job_id')} 已经是「{job.get('status')}」状态，不需要取消。"
         task = job.get("task")
         job["status"] = "cancelled"
+        self._persist_job(job)
         if task and not task.done():
             task.cancel()
         self._jobs.pop(uid, None)
