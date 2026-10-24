@@ -17,19 +17,19 @@
 
 | 功能 | 工具 | 一句话说明 |
 |------|------|-----------|
-| 沙盒写作 | sandbox_write | 按风格卡+约束+作品记忆 生成/续写/改写/重写/局部修订，落盘 txt；mode=generate/continue/rewrite/revise |
+| 沙盒写作 | sandbox_write | 按风格卡+约束+作品记忆 生成/续写/改写/重写/局部修订，落盘 txt；mode=generate/continue/rewrite/revise；resume=断点续跑 |
 | 写作进度 | sandbox_progress | 查后台分节任务进度 |
 | 写作取消 | sandbox_cancel | 中断后台任务，已写部分保留 |
 | 约束设置 | sandbox_settings | 改长度/人称/尺度/忌讳词/描写偏好/节奏/人格保留 |
 | 沙盒状态 | sandbox_status | 查看当前风格卡与约束 |
 | 风格学习 | sandbox_learn | 从 library/ + favorites/ 提炼风格卡；有激活作品则存作品级 |
 | 素材收藏 | sandbox_favorite | 收藏上一段输出，风格学习里权重最高 |
-| 大纲 | sandbox_outline | write/revise 走说明书 → save 校验 → confirm/discard；note 灵感便签；link 章节接续 |
+| 大纲 | sandbox_outline | write/revise 走说明书 → save 校验 → confirm/discard；save_batch 分批收单；note 灵感便签；link 章节接续 |
 | 人设卡 | sandbox_character | create/view/update/delete/audit/save；全局/作品双存储 |
 | 角色提炼 | sandbox_extract_characters | 从文本提炼人设卡，阈值 0.6/3，结果标注 新建/跳过/龙套 |
 | 风格组合 | sandbox_style_combo | 多卡融合 + 单维度指定来源，按激活作品隔离 |
 | 作品工作区 | sandbox_work | 作品切换/新建；action=config 调注入与提炼开关 |
-| 旧稿清理 | sandbox_cleanup | 列 30 天前旧稿 → 用户过目 → 按编号删 |
+| 旧稿清理 | sandbox_cleanup | 列 30 天前旧稿 → 用户过目 → 按编号删；scrub 元信息清洗 |
 | 沙盒重置 | sandbox_reset | 清空历史（可连约束风格卡一起清） |
 
 ### 1.2 核心机制（非工具，已交付）
@@ -50,21 +50,26 @@
 | 说明书模式 | prompts.py | CHARACTER_GUIDE/OUTLINE_GUIDE；黑盒生成改为主模型编写 + 代码校验收单 |
 | 作品级风格卡 | core/style.py | 作品三件套 style_card/style_cards/combo，无卡回退全局 |
 | 注入/提炼开关 | core/works.py | story_config：inject_memory / inject_characters / auto_extract（默认关） |
+| 流式调用+错误分类 | handlers/base.py `_llm_chat_ex` + core/llmerrors.py | 流式+空闲超时，慢生成不误杀；失败报真实类别（超时/限流/上下文超限） |
+| 引擎配置 | _conf_schema.yaml → BaseMixin._ENGINE | 引擎参数可配置（每节默认 2000 字），WebUI 插件配置页调整 |
+| 任务落盘断点续跑 | handlers/base.py `_scan_interrupted_jobs` + handlers/write.py `_persist_job`/`_resume_write_job` | 任务逐节写 jobs.json，重启后 sandbox_write(resume=jobN) 接续 |
+| 完稿深层清洗 | core/textclean.py | write.py 每节捕获即清洗 + misc.py action=scrub 清存量（留 .bak 备份） |
+| 大纲分批合并 | core/outlineops.py + handlers/outline.py | save_batch 每批 ≤3 章合并收单，confirm 做完整连续性校验 |
 
 ## 2. 功能代码导航
 
-### 2.1 目录结构（2026-09-25 现状）
+### 2.1 目录结构（2026-10-24 现状）
 
 ```
 astrbot_plugin_write_sandbox/
 ├── main.py            ← 插件入口：@register + 14 个工具注册壳（39 行）
 ├── handlers/          ← 业务逻辑 Mixin（2026-09-25 由 main.py 拆分）
-│   ├── base.py        ← BaseMixin：__init__/_get_sandbox/_llm_chat/_clean + PLUGIN_ID
-│   ├── write.py       ← WriteMixin：sandbox_write/progress/cancel 全链路（最肥）
-│   ├── outline.py     ← OutlineMixin：sandbox_outline + _validate_outline + _diff_outline_chapters
+│   ├── base.py        ← BaseMixin：__init__/_get_sandbox/_llm_chat_ex/_llm_chat/_clean + 引擎配置 _ENGINE + 任务落盘
+│   ├── write.py       ← WriteMixin：sandbox_write/progress/cancel + 断点续跑（最肥）
+│   ├── outline.py     ← OutlineMixin：sandbox_outline（save_batch/confirm）+ _validate_outline + _diff_outline_chapters
 │   ├── character.py   ← CharacterMixin：sandbox_character/extract_characters + 校验
 │   ├── learn.py       ← LearnMixin：sandbox_learn/favorite + _sample_source_text/_pack_sources
-│   └── misc.py        ← MiscMixin：settings/status/style_combo/work/cleanup/reset
+│   └── misc.py        ← MiscMixin：settings/status/style_combo/work/cleanup(list/delete/scrub)/reset
 ├── core/              ← 沙盒核心包（2026-09-21 由 core.py 拆分）
 │   ├── __init__.py    ← 导出 Sandbox（门面）
 │   ├── sandbox.py     ← class Sandbox（Mixin 组合）
@@ -75,7 +80,13 @@ astrbot_plugin_write_sandbox/
 │   ├── characters.py  ← 人设卡全套（含字段合并 update、foreign 检测、audit）
 │   ├── library.py     ← 素材库、收藏
 │   ├── analysis.py    ← 重复检测、对话提取、白名单
-│   └── cleanup.py     ← 过期文件清理
+│   ├── cleanup.py     ← 过期文件清理
+│   ├── llmerrors.py   ← LLM 错误分类（超时/限流/上下文超限/供应商/空响应）
+│   ├── textclean.py   ← 完稿深层清洗（分节标题/状态标记/注记行剥离）
+│   └── outlineops.py  ← 大纲分批合并与结构校验
+├── tests/
+│   └── test_p0.py     ← P0 纯函数单测（python tests/test_p0.py，无需依赖）
+├── _conf_schema.yaml  ← 引擎参数配置（注入 BaseMixin._ENGINE）
 ├── prompts.py         ← 提示词模板 + 三份说明书
 ├── metadata.yaml
 └── PLAN.md
@@ -91,6 +102,7 @@ astrbot_plugin_write_sandbox/
 | 人设卡 | handlers/character.py + core/characters.py | create→save 校验→view/update/audit 各走一遍 |
 | 风格卡/组合/约束 | core/style.py + handlers/learn.py + misc.py | 学习→状态→组合 set/clear，验证作品回退全局 |
 | 作品工作区/摘要/设定书 | core/works.py | 长文写章→摘要追加→设定书覆盖 |
+| LLM 调用/超时/任务续跑 | handlers/base.py + handlers/write.py + core/llmerrors.py | python tests/test_p0.py + py_compile |
 | 提示词/说明书 | prompts.py | lint + 生成冒烟 |
 
 ## 3. 未完成的未来任务
@@ -102,9 +114,10 @@ astrbot_plugin_write_sandbox/
 
 ## 4. 最近改动小尾巴
 
-1. 2026-09-27 修复口水词哨兵失效【汐小姐要求】：core/analysis.py `_extract_dialogues`、core/library.py `_read_sources`/`_read_texts` 三个方法在模块化拆分后丢失 `@staticmethod` 装饰器（无 self 亦无装饰器），经 `self.xxx()` 实例调用即 TypeError，且被 write.py 的 try/except 静默吞掉，导致完稿哨兵「检测+自动修订」整条链路不生效。补回 `@staticmethod` 后恢复；已对 Sandbox 全方法做签名级体检 + 全域冒烟通过。
-2. 2026-09-25 风格卡作品级绑定 + 注入/提炼三开关（inject_memory/inject_characters/auto_extract）+ 角色卡提取收紧 0.6/3
-2. 2026-09-25 main.py → handlers/ 包拆分（Mixin 式，56c205b）
-3. 2026-09-21 局部修改优化：正文 mode=revise + 角色卡/大纲说明书模式
-4. 2026-09-21 core.py → core/ 包拆分（Mixin 式）
-5. 2026-09-13 写作体验小部件：章节接续 / 废稿清理 / 口水词哨兵 / 灵感便签
+1. 2026-10-24 P0 稳定性改造【汐小姐要求】：_llm_chat 流式化+空闲超时+错误分类（超时/限流/上下文超限可辨）、引擎参数配置化（每节 4000→2000）、大纲 save_batch 分批收单+confirm 严格校验、写作任务 jobs.json 落盘+resume 断点续跑、完稿深层清洗（分节标题/状态标记/注记行剥离，存量走 sandbox_cleanup scrub），新增 core/llmerrors.py、core/textclean.py、core/outlineops.py、tests/test_p0.py、_conf_schema.yaml，版本 0.3.0
+2. 2026-09-27 修复口水词哨兵失效【汐小姐要求】：core/analysis.py `_extract_dialogues`、core/library.py `_read_sources`/`_read_texts` 三个方法在模块化拆分后丢失 `@staticmethod` 装饰器（无 self 亦无装饰器），经 `self.xxx()` 实例调用即 TypeError，且被 write.py 的 try/except 静默吞掉，导致完稿哨兵「检测+自动修订」整条链路不生效。补回 `@staticmethod` 后恢复；已对 Sandbox 全方法做签名级体检 + 全域冒烟通过。
+3. 2026-09-25 风格卡作品级绑定 + 注入/提炼三开关（inject_memory/inject_characters/auto_extract）+ 角色卡提取收紧 0.6/3
+4. 2026-09-25 main.py → handlers/ 包拆分（Mixin 式，56c205b）
+5. 2026-09-21 局部修改优化：正文 mode=revise + 角色卡/大纲说明书模式
+6. 2026-09-21 core.py → core/ 包拆分（Mixin 式）
+7. 2026-09-13 写作体验小部件：章节接续 / 废稿清理 / 口水词哨兵 / 灵感便签
