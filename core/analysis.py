@@ -67,6 +67,7 @@ class AnalysisMixin:
             pass
         return names
 
+    @staticmethod
     def _extract_dialogues(text: str) -> list[tuple[int, str]]:
         """抽取引号内对白：返回 [(段落号, 对白文本)]。"""
         out: list[tuple[int, str]] = []

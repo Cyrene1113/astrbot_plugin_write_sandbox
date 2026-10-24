@@ -23,6 +23,7 @@ class LibraryMixin:
     def favorite_sources(self) -> list[tuple[str, str]]:
         return self._read_sources(self.favorites_dir)
 
+    @staticmethod
     def _read_sources(directory: Path) -> list[tuple[str, str]]:
         """读取目录下所有 txt/md 素材，返回 [(文件名, 内容)]，供逐篇学习。"""
         sources: list[tuple[str, str]] = []
@@ -37,6 +38,7 @@ class LibraryMixin:
                 continue
         return sources
 
+    @staticmethod
     def _read_texts(directory: Path) -> list[str]:
         texts: list[str] = []
         for p in sorted(directory.glob("*")):

@@ -559,7 +559,7 @@ class WriteMixin:
     ) -> str:
         """本节字数不足时，紧接末尾续写补足；最多补 _SECTION_LENGTH_EXTRA 轮。"""
         for _ in range(self._SECTION_LENGTH_EXTRA):
-            cur = len(text.replace("\n", "").replace(" ", ""))
+            cur = self._effective_length(text)
             if cur >= need_len:
                 break
             tail = text[-1500:]
@@ -574,8 +574,43 @@ class WriteMixin:
             ext = self._clean(raw)
             if not ext:
                 break
+            # 续写内容与上一节尾巴高度相似 → 判定为复读，丢弃重试
+            if self._too_similar(ext, tail):
+                continue
             text = text + "\n\n" + ext
         return self._apply_banned_words(text, sandbox)
+
+    @staticmethod
+    def _effective_length(text: str) -> int:
+        """净字数：先按段落做相似度去重，再统计去空白后的字符数。
+        防止思考段、重复段虚增字数、绕过字数线。"""
+        paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+        kept: list[str] = []
+        for p in paras:
+            dup = False
+            for q in kept[-5:]:
+                if p == q:
+                    dup = True
+                    break
+                if len(q) > 20 and len(p) > 20:
+                    if difflib.SequenceMatcher(None, p, q).ratio() >= 0.85:
+                        dup = True
+                        break
+            if not dup:
+                kept.append(p)
+        return sum(len(k.replace("\n", "").replace(" ", "")) for k in kept)
+
+    @staticmethod
+    def _too_similar(a: str, b: str, threshold: float = 0.75) -> bool:
+        """判断两段文本是否高度相似（用于续写复读检测）。"""
+        if not a or not b:
+            return False
+        a = re.sub(r"\s+", "", a)
+        b = re.sub(r"\s+", "", b)
+        n = min(len(a), len(b))
+        if n < 20:
+            return False
+        return difflib.SequenceMatcher(None, a[-n:], b[-n:]).ratio() >= threshold
 
     @staticmethod
     def _strip_story_mark(text: str) -> tuple[str, Optional[bool]]:

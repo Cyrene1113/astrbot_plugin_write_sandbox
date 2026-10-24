@@ -34,6 +34,51 @@ class BaseMixin:
         self._MAX_SECTIONS = 30            # 单次任务最多分节数
         self._SECTION_RETRY = 2            # 单节失败额外重试次数
         self._SECTION_LENGTH_EXTRA = 3     # 单节字数不足时自动续写补足的轮数上限
+        self._bind_own_llm_tools()
+
+    def _bind_own_llm_tools(self) -> None:
+        """把本插件注册的 LLM 工具绑定到当前插件实例上。
+
+        框架的绑定循环要求 handler.__module__ 等于插件主模块路径；
+        工具拆分到 handlers/ 子模块后路径不匹配，导致实例绑定失败，
+        调用时 event 被当成 self 吞掉而报 missing 'event'。
+        这里在 __init__ 里手动补齐：把 handler 包成 partial(raw, self)
+        并设置 handler_module_path。框架绑定循环遇到「partial 且路径
+        匹配」时会把 partial 解包重绑到 metadata.star_cls（同一个实例），
+        幂等安全；不经过框架路径时 partial 本身也已绑好实例。
+        """
+        try:
+            import functools
+
+            from astrbot.core.provider.register import llm_tools
+
+            plugin_root = f"data.plugins.{PLUGIN_ID}"
+            main_path = f"{plugin_root}.main"
+            bound = 0
+            logger.info(f"[沙盒诊断] 全局工具数={len(llm_tools.func_list)} root={plugin_root}")
+            for func_tool in llm_tools.func_list:
+                handler = getattr(func_tool, "handler", None)
+                hmod = getattr(handler, "__module__", "") if handler else ""
+                hmp = getattr(func_tool, "handler_module_path", None)
+                logger.info(
+                    f"[沙盒诊断] tool={getattr(func_tool, 'name', '?')} "
+                    f"handler={type(handler).__name__} hmod={hmod!r} hmp={hmp!r}"
+                )
+                if handler is None:
+                    continue
+                handler_module = getattr(handler, "__module__", "") or ""
+                if not handler_module.startswith(plugin_root):
+                    continue
+                raw = handler.func if isinstance(handler, functools.partial) else handler
+                func_tool.handler = functools.partial(raw, self)
+                func_tool.handler_module_path = main_path
+                bound += 1
+            if bound:
+                logger.info(f"写作沙盒已手动绑定 {bound} 个 LLM 工具到插件实例。")
+            else:
+                logger.warning("[沙盒诊断] 没有匹配到任何本插件工具！")
+        except Exception as e:
+            logger.error(f"写作沙盒工具绑定失败: {e}")
 
     # ── 沙盒获取 ──────────────────────────────
     def _get_sandbox(self, event: AstrMessageEvent) -> Optional[Sandbox]:
@@ -83,6 +128,47 @@ class BaseMixin:
         m = re.match(r"^```(?:txt|text|markdown|md)?\s*(.*?)\s*```$", text, re.S)
         if m:
             text = m.group(1).strip()
+        # 剥离模型可能混入的非正文前缀（思考/说明/引导语）与独立括号注记行
+        text = BaseMixin._strip_non_story(text)
+        return text
+
+    @staticmethod
+    def _strip_non_story(text: str) -> str:
+        """剥离模型输出开头可能混入的非正文内容：
+        思考/说明前缀、引导语（如「以下为正文」）以及独立成行的括号注记。
+        只处理前 8 行；剥离后若无剩余内容则保留原文，防止误删。"""
+        lines = text.split("\n")
+        cut = 0
+        meta_kw = r"思考|思考过程|思路|心理活动|说明|注释|备注|写作说明"
+        for i, ln in enumerate(lines[:8]):
+            s = ln.strip()
+            if not s:
+                cut = i + 1
+                continue
+            # ① 关键词+冒号开头：思考：/说明：/注： 等
+            if re.match(rf"^\s*(?:{meta_kw})[：:，,。\s]", s):
+                cut = i + 1
+                continue
+            # ② 括号/方括号包裹的标记块：【思考过程】/（写作说明）等
+            if re.match(rf"^[（(【\[]\s*(?:{meta_kw})\s*[）)】\]]", s):
+                cut = i + 1
+                continue
+            # ③ 引导语整行：好的，以下为正文：/正文如下：/以下内容为正文
+            if re.match(
+                r"^\s*(?:好的|好|嗯|那么|ok|OK)?[，,:：\s]*(?:以下为正文|以下是正文|正文如下|正文开始|正文内容如下|以下内容为正文)[：:，,。\s]?\s*$",
+                s,
+            ):
+                cut = i + 1
+                continue
+            # ④ 独立括号注记行：（注：xxx）（说明：xxx）
+            if re.match(r"^[（(]\s*(?:注|说明|备注|提示|小记)[：:][^）)]{0,40}[）)]\s*$", s):
+                cut = i + 1
+                continue
+            break
+        if cut:
+            rest = "\n".join(lines[cut:]).strip()
+            if rest:
+                return rest
         return text
 
     def _last_assistant_output(self, sandbox: Sandbox, max_chars: int = 800) -> str:

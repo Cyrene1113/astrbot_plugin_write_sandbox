@@ -102,7 +102,8 @@ astrbot_plugin_write_sandbox/
 
 ## 4. 最近改动小尾巴
 
-1. 2026-09-25 风格卡作品级绑定 + 注入/提炼三开关（inject_memory/inject_characters/auto_extract）+ 角色卡提取收紧 0.6/3
+1. 2026-09-27 修复口水词哨兵失效【汐小姐要求】：core/analysis.py `_extract_dialogues`、core/library.py `_read_sources`/`_read_texts` 三个方法在模块化拆分后丢失 `@staticmethod` 装饰器（无 self 亦无装饰器），经 `self.xxx()` 实例调用即 TypeError，且被 write.py 的 try/except 静默吞掉，导致完稿哨兵「检测+自动修订」整条链路不生效。补回 `@staticmethod` 后恢复；已对 Sandbox 全方法做签名级体检 + 全域冒烟通过。
+2. 2026-09-25 风格卡作品级绑定 + 注入/提炼三开关（inject_memory/inject_characters/auto_extract）+ 角色卡提取收紧 0.6/3
 2. 2026-09-25 main.py → handlers/ 包拆分（Mixin 式，56c205b）
 3. 2026-09-21 局部修改优化：正文 mode=revise + 角色卡/大纲说明书模式
 4. 2026-09-21 core.py → core/ 包拆分（Mixin 式）
