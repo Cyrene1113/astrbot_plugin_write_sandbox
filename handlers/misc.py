@@ -323,7 +323,8 @@ class MiscMixin:
                     continue
                 try:
                     cleaned = deep_clean_sections(p.read_text(encoding="utf-8"))
-                    bak = p.with_name(p.stem + ".bak_scrub" + p.suffix)
+                    # 备份名后缀放最后（ch01_xx.txt.bak_scrub）：*.txt / ch*.txt glob 不会匹配
+                    bak = p.with_name(p.name + ".bak_scrub")
                     if not bak.exists():
                         bak.write_text(p.read_text(encoding="utf-8"), encoding="utf-8")
                     p.write_text(cleaned + "\n", encoding="utf-8")

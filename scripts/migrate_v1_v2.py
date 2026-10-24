@@ -27,10 +27,15 @@ from core.cardops import PLOT_KEYS, detect_meta_sentences, normalize_card  # noq
 
 
 def iter_card_files(uid_dir: Path):
-    yield from sorted((uid_dir / "characters").glob("*.json"))
-    for story in sorted((uid_dir / "stories").iterdir()) if (uid_dir / "stories").exists() else []:
-        if story.is_dir():
-            yield from sorted((story / "characters").glob("*.json"))
+    def _cards(d: Path):
+        # 备份文件（*.json.bak_v1 等）不参与遍历，防二次迁移
+        return [p for p in sorted(d.glob("*.json")) if ".bak" not in p.name]
+    yield from _cards(uid_dir / "characters")
+    stories = uid_dir / "stories"
+    if stories.exists():
+        for story in sorted(stories.iterdir()):
+            if story.is_dir():
+                yield from _cards(story / "characters")
 
 
 def work_of(uid_dir: Path, card_path: Path) -> str:
@@ -115,7 +120,8 @@ def main() -> int:
                 else:
                     dropped.setdefault(str(card_path.relative_to(uid_dir)), []).extend(
                         [f"{k}: {v}" for k, v in moved.items() if v])
-            bak = card_path.with_name(card_path.stem + ".bak_v1" + card_path.suffix)
+            # 备份名后缀放最后（汐.json.bak_v1）：*.json glob 不会匹配，卡池/选角/审计不受污染
+            bak = card_path.with_name(card_path.name + ".bak_v1")
             if not bak.exists():
                 bak.write_text(card_path.read_text(encoding="utf-8"), encoding="utf-8")
             card_path.write_text(json.dumps(new_card, ensure_ascii=False, indent=2), encoding="utf-8")
