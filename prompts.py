@@ -272,13 +272,16 @@ def build_outline_revise_prompt(instruction: str, current_outline: str, referenc
     )
 
 # 【汐小姐要求】大纲编写改「说明书模式」：工具不再黑盒生成，而是给主模型一份行动指南，
-# 由主模型照格式框架亲手编写，工具只负责 action=save 收单、结构校验、差异审查与落盘。
-OUTLINE_GUIDE = """你是剧情架构师。用户给出了大纲要求。请按下面的【步骤】和【格式框架】亲手编写一份大纲 JSON，然后调用 sandbox_outline 的 action=save（把 JSON 放进 text 参数）存为待确认草稿。
+# 由主模型照格式框架亲手编写，工具只负责收单（save 整份 / save_batch 分批）、结构校验、差异审查与落盘。
+OUTLINE_GUIDE = """你是剧情架构师。用户给出了大纲要求。请按下面的【步骤】和【格式框架】亲手编写大纲 JSON，分批调用 sandbox_outline 的 action=save_batch（把 JSON 放进 text 参数）存为待确认草稿。
 
-【步骤】
+【步骤（分批提交，防单次输出超时）】
 1. 先读用户要求：章节数、密度曲线、结局、核心悬念等。
-2. 先定全局脉络（meta），再逐章列节点（chapters）。
-3. 按格式框架组装，保持精炼；最后用 action=save 提交。
+2. 第一批：定全局脉络 meta + 第 1~3 章，组装 {"meta": {...}, "chapters": [第1章, 第2章, 第3章]}，
+   调用 sandbox_outline 的 action=save_batch 提交，等工具返回。
+3. 之后每批 ≤3 章：只带 chapters 数组继续 action=save_batch，直到写满用户要求的章数。
+4. 铁律：每批必须等上一次 save_batch 返回后再发下一批；禁止一次提交全部章节。
+5. 全部章号连续后告诉用户「大纲草稿已就绪，请过目」，用户说确认后再调 action=confirm。
 
 【格式框架】（键名固定，禁止改名）
 {

@@ -7,6 +7,7 @@ from typing import Optional
 
 from astrbot.api.event import AstrMessageEvent, filter
 
+from ..core.outlineops import merge_outline_batch, missing_chapters
 from ..prompts import build_outline_guide, build_outline_revise_guide
 
 
@@ -30,13 +31,14 @@ class OutlineMixin:
         当用户说「给《XX》定个大纲」「规划一下剧情」「看看大纲」时调用。
         大纲生成后先存为**待确认草稿**，不直接落盘生效；用户看完说可以/确认后，
         再用 action=confirm 落盘为正式 outline.json。写正文前若存在未确认草稿会先拦截。
+        大纲章节多（>4 章）时分批提交：先 action=save_batch 存 meta+前 3 章，之后每批 3 章继续 save_batch，齐了再 confirm。
         action=discard 丢弃草稿；action=view 优先展示待确认草稿（带提示），无草稿才展示正式大纲。
         action=note 给某章挂灵感便签（ch + text，写该章时自动注入）；action=clearnote 清空某章便签。
         action=link 设置章节接续模式（link_mode=continuous 贴上一章结尾 / break 只给氛围引子 / auto 自动）。
 
         Args:
             instruction(string): 大纲要求，如「十章，涩涩密度前期暧昧后期露骨，结局留白」。
-            action(string): write=返回大纲编写说明书（默认，主模型按指南写好 JSON 后用 save 提交）；save=收下主模型写好的大纲 JSON（放 text 参数），做结构校验+差异审查后存为待确认草稿；revise=返回大纲修订说明书（只改点名部分，不推倒重来）；confirm=确认草稿落盘；discard=丢弃草稿；view=查看；note=挂灵感便签；clearnote=清空便签；link=设置章节接续。
+            action(string): write=返回大纲编写说明书（默认，主模型按指南写好 JSON 后用 save 提交）；save=收下主模型写好的大纲 JSON（放 text 参数），做结构校验+差异审查后存为待确认草稿；save_batch=分批收单（每批 meta+≤3 章，防单次输出超时）；revise=返回大纲修订说明书（只改点名部分，不推倒重来）；confirm=确认草稿落盘；discard=丢弃草稿；view=查看；note=挂灵感便签；clearnote=清空便签；link=设置章节接续。
             work(string): 可选，作品名。传入则切换/新建该作品；留空沿用当前激活作品。
             name(string): 兼容旧参数名，等价于 work。
             ch(int): note/clearnote 时指定章节号。
@@ -61,9 +63,18 @@ class OutlineMixin:
                 )
             return sandbox.render_outline(active)
         if action == "confirm":
+            pending = sandbox.load_pending_outline(active)
+            if pending is None:
+                return "当前没有待确认的大纲草稿，先写一份再确认。"
+            ok, problems = self._validate_outline(pending, strict=True)
+            if not ok:
+                return (
+                    "草稿还有结构问题，先修正再确认：\n- " + "\n- ".join(problems)
+                    + "\n\n（缺章/乱号用 action=save_batch 补齐或覆盖同号章）"
+                )
             if sandbox.confirm_outline(active):
                 return f"大纲已确认落盘《{active}》♪\n\n" + sandbox.render_outline(active)
-            return "当前没有待确认的大纲草稿，先写一份再确认。"
+            return "大纲落盘失败，请重试 confirm。"
         if action == "discard":
             if sandbox.has_pending_outline(active):
                 sandbox.discard_pending_outline(active)
@@ -111,6 +122,40 @@ class OutlineMixin:
                 "人家会做程序级差异审查。\n\n"
                 + guide
             )
+        if action == "save_batch":
+            if not text.strip():
+                return "save_batch 需要把本批 JSON 放进 text 参数：{\"meta\": {...}, \"chapters\": [...]}（首批带 meta，之后每批 ≤3 章）。"
+            try:
+                parsed = json.loads(text)
+                if not isinstance(parsed, dict):
+                    raise ValueError
+            except Exception:
+                m = re.search(r"\{.*\}", text, re.S)
+                try:
+                    parsed = json.loads(m.group(0)) if m else None
+                    if not isinstance(parsed, dict):
+                        raise ValueError
+                except Exception:
+                    return "save_batch 收到的不是合法 JSON 对象，请整理后重提。"
+            cur = sandbox.load_pending_outline(active) or {"meta": {}, "chapters": []}
+            merged = merge_outline_batch(cur, parsed)
+            if not merged["meta"].get("title"):
+                merged["meta"]["title"] = active
+            ok, problems = self._validate_outline(merged, strict=False)
+            if not ok:
+                return "本批合并后结构有问题，未入库：\n- " + "\n- ".join(problems) + "\n请修正后重新 save_batch。"
+            sandbox.save_pending_outline(active, merged)
+            chs = [c["ch"] for c in merged["chapters"]]
+            missing = missing_chapters(merged)
+            lines = [f"已收下本批。《{active}》草稿累计 {len(chs)} 章（{chs[0]}~{chs[-1]}）。" if chs
+                     else f"已收下 meta。《{active}》草稿还没有章节节点。"]
+            if missing:
+                lines.append(f"还缺：第 {'、'.join(str(c) for c in missing)} 章——请用 save_batch 补齐这些章号。")
+            else:
+                lines.append("章号连续。写满用户要求的章数后，请让用户过目草稿，用户确认后调用 action=confirm（会做完整连续性校验）。")
+            preview = sandbox.render_pending_outline(active).split("\n")
+            lines.append("当前草稿预览：\n" + "\n".join(preview[:15]) + ("\n…" if len(preview) > 15 else ""))
+            return "\n".join(lines)
         if action == "save":
             if not text.strip():
                 return "save 需要把写好的大纲 JSON 放进 text 参数（照着 action=write 返回的说明书编写）。"
@@ -168,8 +213,9 @@ class OutlineMixin:
         )
 
     @staticmethod
-    def _validate_outline(outline: dict) -> tuple[bool, list[str]]:
+    def _validate_outline(outline: dict, strict: bool = True) -> tuple[bool, list[str]]:
         """大纲结构校验：meta/chapters 结构、ch 从 1 连续递增、字段类型。
+        strict=False 为分批中途校验：允许暂无章节节点、章号暂不连续（重复/类型问题仍照查）。
         返回 (是否通过, 问题列表)。"""
         problems: list[str] = []
         if not isinstance(outline, dict):
@@ -179,7 +225,7 @@ class OutlineMixin:
         chapters = outline.get("chapters")
         if not isinstance(chapters, list):
             return False, problems + ["chapters 必须是数组"]
-        if not chapters:
+        if not chapters and strict:
             problems.append("chapters 不能为空数组，至少要有章节节点")
         seen: set[int] = set()
         for i, node in enumerate(chapters, start=1):
@@ -193,7 +239,7 @@ class OutlineMixin:
             if ch in seen:
                 problems.append(f"章号重复：ch={ch}")
             seen.add(ch)
-            if ch != i:
+            if strict and ch != i:
                 problems.append(f"章号不连续：第 {i} 个节点 ch={ch}（应为 {i}，需从 1 连续递增）")
             for key in ("summary", "title", "tone", "scale", "cliffhanger", "notes"):
                 v = node.get(key)
