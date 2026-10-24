@@ -12,6 +12,7 @@ from ..core import (
     DEFAULT_CONSTRAINTS,
     DEFAULT_STYLE_CARD,
 )
+from ..core.textclean import deep_clean_sections, line_is_meta
 
 
 class MiscMixin:
@@ -246,16 +247,17 @@ class MiscMixin:
         days: int = 30,
         targets: str = "",
     ) -> str:
-        """列出/清理沙盒里的旧废稿（短篇输出 + 作品章节）。
+        """列出/清理沙盒里的旧废稿（短篇输出 + 作品章节），或清洗元信息残留。
 
         当用户说「看看有哪些旧稿」「清理一下旧文件」「把很久没动的稿子列出来」时调用。
         先 action=list 列出超过 days 天未修改的文件（带编号），用户点名编号后
         再 action=delete 删除（targets 传编号，如「1,3」）。
+        用户说「清洗旧稿的残留标题/元信息」时用 action=scrub：先列清单，用户确认后执行。
 
         Args:
-            action(string): list=列出旧文件（默认）；delete=按编号删除。
+            action(string): list=列出旧文件（默认）；delete=按编号删除；scrub=扫描并清洗章节/产出文件里的分节标题等元信息残留（先列清单，targets 选编号执行）。
             days(int): 多少天以上算旧稿，默认 30。
-            targets(string): delete 时要删的编号，逗号分隔，如「1,3,5」。
+            targets(string): delete/scrub 时要操作的编号，逗号分隔，如「1,3,5」；scrub 传「全部」清洗所有命中文件。
         """
         sandbox = self._get_sandbox(event)
         if not sandbox:
@@ -284,6 +286,51 @@ class MiscMixin:
             if missed:
                 body += f"\n没删掉的编号：{', '.join(missed)}（可能越界或删除失败）"
             return body
+        if action == "scrub":
+            files: list[tuple[str, Path]] = []
+            for p in sorted(sandbox.outputs_dir.glob("*.txt")):
+                files.append((f"短篇:{p.name}", p))
+            for w in sandbox.list_works():
+                for p in sorted(sandbox.chapters_dir(w).glob("*.txt")):
+                    if p.is_file():
+                        files.append((f"《{w}》:{p.name}", p))
+            hits: list[tuple[str, Path, list[str]]] = []
+            for label, p in files:
+                try:
+                    original = p.read_text(encoding="utf-8")
+                except Exception:
+                    continue
+                cleaned = deep_clean_sections(original)
+                if cleaned != original.strip():
+                    bad = [ln.strip() for ln in original.split("\n")
+                           if ln.strip() and line_is_meta(ln)]
+                    if bad:  # 只有真正命中元信息行的文件才进清单（纯空行压缩不列）
+                        hits.append((label, p, bad))
+            if not hits:
+                return "扫了一遍，没有发现分节标题/状态标记等元信息残留♪"
+            if not targets.strip():
+                lines = [f"发现 {len(hits)} 个文件有元信息残留（列出的行将被删除）："]
+                for i, (label, _, bad) in enumerate(hits, 1):
+                    lines.append(f"{i}. {label}（{len(bad)} 行，如：{bad[0][:50]}）")
+                lines.append("确认清洗就说「scrub 全部」，或指定编号如 targets=1,3。")
+                return "\n".join(lines)
+            nums = [n.strip() for n in re.split(r"[,，、\s]+", targets) if n.strip()]
+            do_all = any(n in ("all", "全部", "a") for n in nums)
+            idx = {int(n) for n in nums if n.isdigit()}
+            done = skipped = 0
+            for i, (label, p, _) in enumerate(hits, 1):
+                if not (do_all or i in idx):
+                    continue
+                try:
+                    cleaned = deep_clean_sections(p.read_text(encoding="utf-8"))
+                    bak = p.with_name(p.stem + ".bak_scrub" + p.suffix)
+                    if not bak.exists():
+                        bak.write_text(p.read_text(encoding="utf-8"), encoding="utf-8")
+                    p.write_text(cleaned + "\n", encoding="utf-8")
+                    done += 1
+                except Exception:
+                    skipped += 1
+            return f"清洗完成：{done} 个文件（已留 .bak_scrub 备份），失败 {skipped} 个。"
         # list
         stale = sandbox.list_stale_files(days=max(1, days))
         if not stale:
