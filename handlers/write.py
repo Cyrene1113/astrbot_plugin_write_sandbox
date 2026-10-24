@@ -469,6 +469,33 @@ class WriteMixin:
                             logger.warning(f"哨兵修订落盘失败: {e}")
             except Exception as e:
                 logger.warning(f"口水词检测失败: {e}")
+            # 元视角哨兵（P1）：独立注记行整行剥除（纯代码）；叙述内嵌的只报告不自动改
+            try:
+                from ..core.cardops import detect_meta_sentences, scrub_meta_lines
+                scanned_text = revised if job.get("revise_report") else full_text
+                cleaned, removed_n = scrub_meta_lines(scanned_text)
+                suspects = [h for h in detect_meta_sentences(scanned_text) if h["kind"] == "suspect"]
+                if removed_n:
+                    job["meta_leak_report"] = f"【元视角哨兵】自动剥除独立注记行 {removed_n} 行。"
+                    try:
+                        if job.get("file_path"):
+                            fp = Path(job["file_path"])
+                            if fp.exists():
+                                cur = fp.read_text(encoding="utf-8").rstrip()
+                                if cur == scanned_text.rstrip():
+                                    fp.write_text(cleaned.rstrip() + "\n", encoding="utf-8")
+                                else:
+                                    rev = fp.with_name(fp.stem + "_元视角清理版" + fp.suffix)
+                                    rev.write_text(cleaned.rstrip() + "\n", encoding="utf-8")
+                                    job["meta_clean_path"] = str(rev)
+                    except Exception as e:
+                        logger.warning(f"元视角清理落盘失败: {e}")
+                if suspects:
+                    tips = "\n".join(f"· 第{h['no']}行：{h['line'][:50]}" for h in suspects[:5])
+                    extra = f"【元视角哨兵】发现 {len(suspects)} 处疑似作者视角语句（未自动改，建议 mode=revise 处理）：\n{tips}"
+                    job["meta_leak_report"] = (job.get("meta_leak_report", "") + "\n" + extra).strip()
+            except Exception as e:
+                logger.warning(f"元视角哨兵失败: {e}")
             await self._notify(job, failed=False)
         except Exception as e:
             logger.error(f"后台写作任务 {job.get('job_id')} 异常: {e}")
@@ -524,7 +551,7 @@ class WriteMixin:
         for n in names:
             card = sandbox.load_character(n, work, work_only=True)
             if card:
-                cards.append(sandbox.render_character(card))
+                cards.append(sandbox.render_character(card, purpose="write"))
         if not cards:
             return ""
         return "【本章选用人设卡（经选角判断自动引入）】\n" + "\n\n".join(cards)
@@ -777,6 +804,10 @@ class WriteMixin:
                     body += f"\n\n【口水词小哨兵·自动修订】{job['revise_report']}"
                     if job.get("revise_path"):
                         body += f"\n修订版另存：{job['revise_path']}"
+                if job.get("meta_leak_report"):
+                    body += "\n\n" + job["meta_leak_report"]
+                if job.get("meta_clean_path"):
+                    body += f"\n元视角清理版另存：{job['meta_clean_path']}"
                 for w in job.get("post_warnings") or []:
                     body += f"\n⚠️ {w}"
                 chunk = job.get("current_chunk") or ""
@@ -1139,20 +1170,7 @@ class WriteMixin:
             # 跨章累计判定：名字必须出现在至少 2 个不同章节文件（单章龙套跳过）
             if sandbox.count_chapter_mentions(work, nm) < 2:
                 continue
-            if sandbox.load_character(nm, work):
-                continue
-            # 已有卡（含别名）查重：防止同一角色换称呼被重复提炼
-            duplicate = False
-            for card_name in sandbox.list_work_characters(work):
-                card = sandbox.load_character(card_name, work)
-                if not card:
-                    continue
-                basic = card.get("basic") if isinstance(card.get("basic"), dict) else {}
-                known = [str(basic.get("name") or "")] + [str(a) for a in (basic.get("aliases") or [])]
-                if any(nm == k or (k and nm in k) for k in known if k):
-                    duplicate = True
-                    break
-            if duplicate:
+            if sandbox.find_character_by_identity(nm, work):
                 continue
             role_hint = str(c.get("role_hint") or "配角")
             traits = str(c.get("traits") or "").strip()
