@@ -394,52 +394,38 @@ def build_revise_text_prompt(instruction: str, full_text: str) -> str:
         .replace("{instruction}", instruction)
     )
 # 长文：人设卡（统一格式，全局/作品双存储）
-CHARACTER_PROMPT = """你是人设设计师。任务：根据用户的一句话描述，生成一张结构化「人设卡 JSON」。
+CHARACTER_PROMPT = """根据用户的一句话描述与正文摘录，生成一张 v2 人设卡 JSON。请按【步骤】和【格式框架】编写。
 
-【结构固定，只输出 JSON】
+【步骤】
+1. 先把用户描述/参考信息里明确给出的信息标为 canon（原样使用，一个字不许改写）。
+2. 缺的条目按角色定位合理演绎补足（外貌细节、口头禅、示例台词、语言节奏），并在 meta.inferred 里登记字段路径。
+3. 禁止出现「未提及/待补充/待正文揭示」这类占位——配角卡可以短，但每一项都要能直接用于写正文。
+
+【格式框架】（键名固定，禁止改名，只输出 JSON）
 {
-  "basic": {
-    "name": "姓名",
-    "aliases": ["别名"],
-    "gender": "性别",
-    "age": "年龄/外貌年龄",
-    "identity": "身份/职业",
-    "appearance": "外貌（发色瞳色体型服饰标志特征）",
-    "personality": "性格核心（3~5条，含缺点）",
-    "quirks": ["习惯/小动作"]
+  "basic": { "name": "姓名（必填）", "aliases": [], "gender": "", "age": "", "identity": "",
+             "appearance": "整体外貌一段", "personality": ["性格 3 条以上，含缺点"],
+             "quirks": ["习惯/小动作"] },
+  "persona": {
+    "appearance_anchors": ["正文可反复引用的具体视觉锚点（发色/瞳色/体型/标志物），主角≥3条"],
+    "sample_dialogue": ["最能立住腔调的示例台词 2~3 句（原样引号体，可含动作插入语）"],
+    "speech_rhythm": "语言节奏一句话（句长/语气词/停顿习惯）"
   },
-  "background": {
-    "origin": "出身来历",
-    "motivation": "核心动机",
-    "secrets": ["秘密/软肋"],
-    "relations": [ { "name": "与谁", "relation": "关系", "note": "现状" } ]
-  },
-  "story": {
-    "role": "定位（主角/配角/反派）",
-    "arc": "人物弧线",
-    "plot_hooks": ["剧情钩子/伏笔"],
-    "scale_role": "涩涩参与度（高/中/低/无）"
-  },
-  "speech": {
-    "tone": "说话腔调",
-    "catchphrases": ["口头禅"],
-    "address_style": "称呼他人方式"
-  }
+  "background": { "origin": "", "motivation": "", "secrets": [],
+                  "relations": [ { "name": "与谁", "relation": "关系" } ] },
+  "story": { "role": "主角/配角/反派", "scale_role": "高/中/低/无" },
+  "speech": { "tone": "说话腔调", "catchphrases": [], "address_style": "称呼他人方式" },
+  "meta": { "inferred": ["你演绎补足的字段路径，如 persona.sample_dialogue、basic.appearance"] }
 }
 
-【要求】（字段为可选项，只填用户明确提到的内容）
-- 所有字段都是可选项：用户描述/参考信息里明确提到的条目才填写；没提到的条目一律省略该键，不要默认补全。
-- 禁止脑补用户没提到的字段内容，尤其不要自动生成人物弧线、剧情钩子、秘密、口头禅、称呼方式、关系等；用户没给就省略。
-- 字符串类条目没内容就省略该键；列表类条目没内容就给空数组 []。
-- personality 用户提到性格才填；若用户只给了一点线索，只写那一点，不扩写缺点。
-- scale_role 只在用户明确提到尺度或能直接判断时填写，判断不了就省略。
+【铁律】（违反即废卡）
+- canon 红线：用户/参考信息明确给出的内容一个字不许编改；拿不准的关联宁可不写。
+- 演绎自由：没给出的条目允许按角色定位补足，但必须登记进 meta.inferred，不许冒充 canon。
+- relations 只写 name+relation，不写 note（剧情进展属于大纲/设定书，不属于人设卡）。
+- 【禁止剧情编排】卡里禁止出现章节号、「第N章之后…」「后期会…」「为主线做铺垫」之类的时间线/剧情安排；
+  人物弧线、剧情钩子一律不写（story 段只有 role 和 scale_role）。
+- 丰富度硬线：主角卡 appearance_anchors≥3、personality≥3、sample_dialogue≥2；配角各≥1。
 - 只输出 JSON，不要输出任何其他文字。
-
-【信息边界铁律】（违反即废卡）
-- 全卡只允许使用【用户描述】与【参考信息】里明确出现的信息，禁止编造。
-- relations 只允许引用这两处明确出现过的角色名；没有可写对象时 relations 留空数组，绝不为了「具体」虚构人名。
-- 用户描述/参考信息里没有的人物、组织、地名、往事，一律不得写进任何字段（含 origin、secrets、plot_hooks、motivation）。
-- 拿不准的关联写「（关系待定，正文未提及）」或直接留空，禁止脑补「与XX有旧」「曾受XX之恩」这类故事里没影子的关联。
 
 【用户描述】
 {description}
@@ -459,51 +445,38 @@ def build_character_prompt(description: str, reference: str = "") -> str:
 
 # 【汐小姐要求】人设卡编写改「说明书模式」：工具不再黑盒生成，而是给主模型一份行动指南，
 # 由主模型照格式框架亲手编写，工具只负责 action=save 收单、结构校验与落盘。
-CHARACTER_GUIDE = """你是人设设计师。用户给了角色描述。请按下面的【步骤】和【格式框架】亲手编写一张人设卡 JSON，然后调用 sandbox_character 的 action=save（把 JSON 放进 text 参数）落盘。
+CHARACTER_GUIDE = """你是人设设计师。用户给了角色描述。请按【步骤】和【格式框架】亲手编写一张人设卡 JSON，
+然后调用 sandbox_character 的 action=save（JSON 放 text 参数、角色名放 name 参数）落盘。
 
 【步骤】
-1. 先读用户描述与参考信息，圈出明确提到的条目（身份/外貌/性格/口头禅等）。
-2. 只填用户明确提到的条目；没提到的键一律省略，不默认补全。
-3. 按下面的格式框架组装 JSON。
+1. 先把用户描述/参考信息里明确给出的信息标为 canon（原样使用，一个字不许改写）。
+2. 缺的条目按角色定位合理演绎补足（外貌细节、口头禅、示例台词、语言节奏），并在 meta.inferred 里登记字段路径。
+3. 禁止出现「未提及/待补充/待正文揭示」这类占位——配角卡可以短，但每一项都要能直接用于写正文。
 
 【格式框架】（键名固定，禁止改名）
 {
-  "basic": {
-    "name": "姓名（必填，没有就留空由工具补）",
-    "aliases": ["别名，数组"],
-    "gender": "性别",
-    "age": "年龄/外貌年龄",
-    "identity": "身份/职业",
-    "appearance": "外貌（发色瞳色体型服饰标志特征）",
-    "personality": "性格核心（3~5条，含缺点）",
-    "quirks": ["习惯/小动作，数组"]
+  "basic": { "name": "姓名（必填）", "aliases": [], "gender": "", "age": "", "identity": "",
+             "appearance": "整体外貌一段", "personality": ["性格 3 条以上，含缺点"],
+             "quirks": ["习惯/小动作"] },
+  "persona": {
+    "appearance_anchors": ["正文可反复引用的具体视觉锚点（发色/瞳色/体型/标志物），主角≥3条"],
+    "sample_dialogue": ["最能立住腔调的示例台词 2~3 句（原样引号体，可含动作插入语）"],
+    "speech_rhythm": "语言节奏一句话（句长/语气词/停顿习惯）"
   },
-  "background": {
-    "origin": "出身来历",
-    "motivation": "核心动机",
-    "secrets": ["秘密/软肋，数组"],
-    "relations": [ { "name": "与谁", "relation": "关系", "note": "现状" } ]
-  },
-  "story": {
-    "role": "定位（主角/配角/反派）",
-    "arc": "人物弧线",
-    "plot_hooks": ["剧情钩子/伏笔，数组"],
-    "scale_role": "涩涩参与度（高/中/低/无）"
-  },
-  "speech": {
-    "tone": "说话腔调",
-    "catchphrases": ["口头禅，数组"],
-    "address_style": "称呼他人方式"
-  }
+  "background": { "origin": "", "motivation": "", "secrets": [],
+                  "relations": [ { "name": "与谁", "relation": "关系" } ] },
+  "story": { "role": "主角/配角/反派", "scale_role": "高/中/低/无" },
+  "speech": { "tone": "说话腔调", "catchphrases": [], "address_style": "称呼他人方式" },
+  "meta": { "inferred": ["你演绎补足的字段路径，如 persona.sample_dialogue、basic.appearance"] }
 }
 
 【铁律】（违反即废卡）
-- 所有字段都是可选项：用户描述/参考信息里明确提到的条目才填写；没提到的条目一律省略该键，不要默认补全。
-- 禁止脑补用户没提到的字段内容，尤其不要自动生成人物弧线、剧情钩子、秘密、口头禅、称呼方式、关系等；用户没给就省略。
-- 字符串类条目没内容就省略该键；列表类条目没内容就给空数组 []。
-- personality 用户提到性格才填；若用户只给了一点线索，只写那一点，不扩写缺点。
-- scale_role 只在用户明确提到尺度或能直接判断时填写，判断不了就省略。
-- relations 只写用户明确提到的关系人；数组元素必须有 name 和 relation；没有可写对象时留空数组，绝不虚构人名。
+- canon 红线：用户/参考信息明确给出的内容一个字不许编改；拿不准的关联宁可不写。
+- 演绎自由：没给出的条目允许按角色定位补足，但必须登记进 meta.inferred，不许冒充 canon。
+- relations 只写 name+relation，不写 note（剧情进展属于大纲/设定书，不属于人设卡）。
+- 【禁止剧情编排】卡里禁止出现章节号、「第N章之后…」「后期会…」「为主线做铺垫」之类的时间线/剧情安排；
+  人物弧线、剧情钩子一律不写（story 段只有 role 和 scale_role）。
+- 丰富度硬线：主角卡 appearance_anchors≥3、personality≥3、sample_dialogue≥2；配角各≥1。
 - 只输出 JSON，不要输出任何其他文字。
 
 【用户描述】
@@ -531,6 +504,7 @@ CHARACTER_EXTRACT_PROMPT = """你是角色分析师。任务：从下面这段�
 - 判断「后续剧情潜力」：该角色是否可能再次出场、是否与主角有持续关系、是否承担伏笔或主线/支线作用；纯事件道具式的背景角色不建卡。
 - 每个角色记录：出现次数（mention_count，按姓名/稳定称呼出现次数粗算）、涉及段落数（sections_involved，按连续文本分段估计含该角色的段数）、置信度（confidence 0~1：是否值得建立人设卡，综合戏份权重、描写丰富度、对剧情的重要性）。
 - 从原文能看出的说话腔调、口头禅、外貌、性格、身份等，简要摘录到 traits。
+  含 1~2 句该角色的原文台词（带引号原样摘录），供生成示例台词用。
 
 【输出 JSON 结构，只输出 JSON】
 {
