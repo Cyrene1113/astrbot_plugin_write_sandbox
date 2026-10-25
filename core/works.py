@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Any, Optional
 
-from .constants import CHAPTERS_DIR_NAME, CHAPTER_SUMMARIES_FILE, DEFAULT_STORY_CONFIG, DEFAULT_STORY_STATE, DRAFTS_DIR_NAME, OUTLINE_FILE, PENDING_OUTLINE_FILE, STORY_CONFIG_FILE, STORY_STATE_FILE, _LOCK, _safe_title
+from .constants import CHAPTERS_DIR_NAME, CHAPTER_SUMMARIES_FILE, DEFAULT_STORY_CONFIG, DEFAULT_STORY_STATE, DRAFTS_DIR_NAME, OUTLINE_FILE, PENDING_OUTLINE_FILE, STORY_CONFIG_FILE, STORY_CONSTRAINTS_FILE, STORY_STATE_FILE, _LOCK, _safe_title
 
 
 class WorksMixin:
@@ -290,6 +290,35 @@ class WorksMixin:
             (self.work_dir(work) / STORY_CONFIG_FILE).write_text(
                 json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8"
             )
+
+    def load_work_constraints(self, work: str) -> dict[str, Any]:
+        """作品级约束（仅存用户显式设置的键；空/缺省回退全局）。"""
+        f = self.work_dir(work) / STORY_CONSTRAINTS_FILE
+        if not f.exists():
+            return {}
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def save_work_constraints(self, work: str, patch: dict[str, Any]) -> None:
+        """合并写入作品级约束：值为空串/空列表/None 的键删除（回退全局）。"""
+        cur = self.load_work_constraints(work)
+        for k, v in (patch or {}).items():
+            if v is None or v == "" or v == []:
+                cur.pop(k, None)
+            else:
+                cur[k] = v
+        with _LOCK:
+            (self.work_dir(work) / STORY_CONSTRAINTS_FILE).write_text(
+                json.dumps(cur, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def render_layered_constraints(self, work: str = "") -> str:
+        """章节指令（另行注入）> 作品级 > 全局 的合并渲染。"""
+        from .constraintops import overlay_constraints, render_layered
+        work_c = self.load_work_constraints(work) if work else {}
+        return render_layered(overlay_constraints(self.constraints, work_c))
 
     def get_chapter_link_mode(self, work: str) -> str:
         return self.load_story_config(work).get("chapter_link", "auto")

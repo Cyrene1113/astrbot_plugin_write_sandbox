@@ -12,6 +12,7 @@ from ..core import (
     DEFAULT_CONSTRAINTS,
     DEFAULT_STYLE_CARD,
 )
+from ..core.constraintops import CONSTRAINT_KEYS
 from ..core.textclean import deep_clean_sections, line_is_meta
 
 
@@ -24,19 +25,40 @@ class MiscMixin:
         event: AstrMessageEvent,
         key: str,
         value: str,
+        work: str = "",
     ) -> str:
         """调整写作沙盒的约束项，立即生效，无需重启。
 
         当用户说「这段太素了，尺度拉高」「换第一人称」「节奏快一点」
         「每段写长一点」「加几个忌讳词」等要求时调用。
+        用户点明「只对《某作品》这样」「这本书单独设置」时，传入 work 设为作品级约束，
+        只对该作品生效且优先于全局；留空则设全局。
 
         Args:
             key(string): 约束项名称，可选：length(长度)、perspective(人称视角)、scale(尺度：暧昧/露骨/极限)、banned_words(忌讳词，逗号分隔)、description_focus(描写偏好)、rhythm(节奏)、keep_persona(是否保留昔涟人格底色 true/false)。
             value(string): 要设置的新值。
+            work(string): 可选，作品名。传入则设置该作品的作品级约束（仅对本次作品生效，优先于全局）；留空设全局。
         """
         sandbox = self._get_sandbox(event)
         if not sandbox:
             return "找不到沙盒（无法识别发送者）。"
+        work_name = work.strip() if work else ""
+        if work_name:
+            if key not in CONSTRAINT_KEYS:
+                return f"未知约束项 {key}，可用项：{', '.join(CONSTRAINT_KEYS)}"
+            if key == "banned_words":
+                norm = [w.strip() for w in re.split(r"[,，、\s]+", value) if w.strip()]
+            elif key == "keep_persona" and value.strip():
+                norm = value.strip().lower() in ("true", "1", "是", "开", "yes", "保留")
+            else:
+                norm = value
+            sandbox.save_work_constraints(work_name, {key: norm})
+            shown = norm if norm not in ("", []) else "（已清除，回退全局）"
+            return (
+                f"《{work_name}》作品级约束已更新：{key} → {shown}\n"
+                "（优先级：章节指令 > 作品级 > 全局）\n\n当前生效约束：\n"
+                + sandbox.render_layered_constraints(work_name)
+            )
         ok, msg = sandbox.set_constraint(key, value)
         return msg + "\n\n当前约束：\n" + sandbox.render_constraints() if ok else msg
 
@@ -56,12 +78,14 @@ class MiscMixin:
         if not sandbox:
             return "找不到沙盒（无法识别发送者）。"
         history = sandbox.load_history()
+        active = sandbox.get_active_work() or ""
         lines = [
             "【风格卡】",
             sandbox.render_style_card(),
             "",
             "【约束】",
-            sandbox.render_constraints(),
+            sandbox.render_layered_constraints(active),
+            "（优先级：章节指令 > 作品级 > 全局；章节指令优先于以上两层）",
             "",
             f"【历史】共 {len(history)} 条片段，最近一条：",
         ]

@@ -64,6 +64,7 @@ OUTLINE_FILE = "outline.json"
 PENDING_OUTLINE_FILE = "outline.pending.json"
 ACTIVE_WORK_FILE = "active_work.json"
 STORY_CONFIG_FILE = "story_config.json"
+STORY_CONSTRAINTS_FILE = "story_constraints.json"
 
 DEFAULT_STORY_CONFIG: dict[str, Any] = {
     "chapter_link": "auto",  # auto 自动 / continuous 连续叙事 / break 断章收尾
