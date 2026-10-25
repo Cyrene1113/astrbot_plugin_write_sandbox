@@ -538,3 +538,55 @@ def build_global_card_select_prompt(chapter_info: str, pool: str) -> str:
         .replace("{chapter_info}", chapter_info or "（无）")
         .replace("{pool}", pool or "（无）")
     )
+
+
+BEAT_EXPAND_PROMPT = """你是场景调度师。把下面「本章大纲」展开为 3~6 个按时间顺序推进的场景 beat（JSON）。
+
+【输出 JSON，只输出 JSON】
+{"beats": [{"scene": "场景与地点一句话", "goal_chars": 本拍目标字数(整数), "turn": "本拍关键转折/完成的事（≤30字）", "carry": "与上一拍的承接或从哪接续（≤20字，首拍写 从本章开头进入）"}]}
+
+【要求】
+- goal_chars 总和 ≈ 本章目标字数（无明确目标时每拍 1500~2500）。
+- beat 是「会发生什么」的可执行场景，不写分析性语言；覆盖大纲全部 plot_points，顺序可微调但不遗漏。
+- 每拍要有具体的地点与人物动作，不要只有情绪。
+
+【本章大纲】
+{chapter_outline}
+
+【用户本章要求】
+{instruction}
+"""
+
+ARC_SUMMARY_PROMPT = """你是剧情摘要员。把下面多章摘要压缩为一段「弧线摘要」（≤300 字），
+保留贯穿这些章节的主线走向、人物关系变化、遗留伏笔与未解决事项；逐章细节舍弃。
+
+【章节摘要】
+{summaries}
+
+只输出弧线摘要正文，不要输出其他文字。
+"""
+
+OUTLINE_DIVERGE_PROMPT = """你是剧情连续性检查员。对比「刚写完的章节摘要」与「下一章大纲」，
+判断下一章计划是否已被正文走向架空或矛盾（人物状态对不上、事件顺序冲突、伏笔被提前消耗）。
+
+【输出 JSON，只输出 JSON】
+{"diverge": true/false, "note": "偏离时用一句话写明改什么（≤60字）；无偏离给空串"}
+
+只输出 JSON。
+"""
+
+
+def build_beat_expand_prompt(chapter_outline: str, instruction: str) -> str:
+    return (BEAT_EXPAND_PROMPT
+            .replace("{chapter_outline}", chapter_outline or "（无）")
+            .replace("{instruction}", instruction or "（无）"))
+
+
+def build_arc_summary_prompt(summaries: str) -> str:
+    return ARC_SUMMARY_PROMPT.replace("{summaries}", summaries)
+
+
+def build_outline_diverge_prompt(chapter_summary: str, next_outline: str) -> str:
+    return (OUTLINE_DIVERGE_PROMPT
+            .replace("{chapter_summary}", chapter_summary or "（无）")
+            .replace("{next_outline}", next_outline or "（无）"))
