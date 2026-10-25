@@ -19,7 +19,7 @@ from .handlers import (
 from .handlers.base import PLUGIN_ID
 
 
-@register(PLUGIN_ID, "昔涟", "✍️ 委托式独立写作沙盒：自然吩咐、自动落盘 txt、风格学习", "0.6.1")
+@register(PLUGIN_ID, "昔涟", "✍️ 委托式独立写作沙盒：自然吩咐、自动落盘 txt、风格学习", "0.6.2")
 class WriteSandboxPlugin(
     BaseMixin,
     WriteMixin,

@@ -82,8 +82,11 @@ BEATS_JSON = json.dumps({"beats": [
     {"scene": "天台收束", "goal_chars": 1000, "turn": "各自离开", "carry": "接上一拍"},
 ]}, ensure_ascii=False)
 
-STATE_JSON = json.dumps({"meta": {"title": "测作"}, "world": {}, "characters": [],
-                         "foreshadowing": [], "unresolved": []}, ensure_ascii=False)
+# 模拟真机 §5-9 的失败模式：前后杂文 + markdown 围栏 + 尾逗号
+STATE_RAW = ('好的，以下是更新后的设定书：\n```json\n'
+             '{"meta": {"title": "测作"}, "world": {"雨夜": "常下雨"}, "characters": [],'
+             ' "foreshadowing": [], "unresolved": [],}\n'
+             '```\n如需调整请说。')
 
 
 def beat_section(prompt: str) -> str:
@@ -102,7 +105,7 @@ WORK_ROUTES = [
     ("【分节写作】", lambda p: "收尾段，故事落幕。【STORY_END】"),
     ("是否已经自然收尾", "否"),
     ("剧情摘要员", "第一章摘要：三拍推进，决裂收束。"),
-    ("设定书管理员", STATE_JSON),
+    ("设定书管理员", STATE_RAW),
     ("剧情连续性检查员", json.dumps({"diverge": False, "note": ""}, ensure_ascii=False)),
     ("小说编辑", "[]"),
 ]
@@ -147,9 +150,10 @@ async def test_beat_flow():
         # ④末拍未打标记 → 收尾判断兜底被调用；非末拍不调用
         assert sum(1 for p in calls if "是否已经自然收尾" in p) == 1
 
-        # ⑤摘要与设定书照常更新
+        # ⑤摘要与设定书照常更新；设定书走的是「杂文+围栏+尾逗号」脏输出（§5-9 失败模式）
         assert sb.load_chapter_summaries("测作")[0]["summary"].startswith("第一章摘要")
-        assert sb.load_story_state("测作")["meta"]["title"] == "测作"
+        state = sb.load_story_state("测作")
+        assert state["meta"]["title"] == "测作" and state["world"] == {"雨夜": "常下雨"}
 
 
 async def test_short_resume():
@@ -246,11 +250,26 @@ async def test_perspective_default():
     assert "第二人称主视角" != p and "风格卡" in p
 
 
+def test_merge_story_state():
+    """§5-9 健壮化：解析缺失/null 的顶层键回退旧值；显式空值视为有意清空。"""
+    from wsroot.handlers import WriteMixin
+    old = {"meta": {"title": "旧"}, "world": {"A": "B"}, "characters": [{"name": "汐"}],
+           "foreshadowing": [{"desc": "d"}], "unresolved": ["u"]}
+    m = WriteMixin._merge_story_state(old, {"meta": {"title": "新"}, "world": {"C": "D"},
+                                            "characters": None})
+    assert m["meta"] == {"title": "新"} and m["world"] == {"C": "D"}
+    assert m["characters"] == [{"name": "汐"}]                       # null 回退旧值
+    assert m["foreshadowing"] == [{"desc": "d"}] and m["unresolved"] == ["u"]  # 缺键回退
+    m2 = WriteMixin._merge_story_state(old, {"world": {}})
+    assert m2["world"] == {} and m2["characters"] == [{"name": "汐"}]  # 显式空 dict 视为清空
+
+
 async def main():
     await test_beat_flow()
     await test_short_resume()
     await test_update_scope_and_merge_guard()
     await test_perspective_default()
+    test_merge_story_state()
     print("test_e2e_offline: ALL PASS")
 
 

@@ -7,6 +7,7 @@ from typing import Optional
 
 from astrbot.api.event import AstrMessageEvent, filter
 
+from ..core.jsonutil import parse_json_object
 from ..core.outlineops import merge_outline_batch, missing_chapters
 from ..prompts import build_outline_guide, build_outline_revise_guide
 
@@ -125,18 +126,9 @@ class OutlineMixin:
         if action == "save_batch":
             if not text.strip():
                 return "save_batch 需要把本批 JSON 放进 text 参数：{\"meta\": {...}, \"chapters\": [...]}（首批带 meta，之后每批 ≤3 章）。"
-            try:
-                parsed = json.loads(text)
-                if not isinstance(parsed, dict):
-                    raise ValueError
-            except Exception:
-                m = re.search(r"\{.*\}", text, re.S)
-                try:
-                    parsed = json.loads(m.group(0)) if m else None
-                    if not isinstance(parsed, dict):
-                        raise ValueError
-                except Exception:
-                    return "save_batch 收到的不是合法 JSON 对象，请整理后重提。"
+            parsed = parse_json_object(text)
+            if parsed is None:
+                return "save_batch 收到的不是合法 JSON 对象，请整理后重提。"
             cur = sandbox.load_pending_outline(active) or {"meta": {}, "chapters": []}
             merged = merge_outline_batch(cur, parsed)
             if not merged["meta"].get("title"):
@@ -159,20 +151,7 @@ class OutlineMixin:
         if action == "save":
             if not text.strip():
                 return "save 需要把写好的大纲 JSON 放进 text 参数（照着 action=write 返回的说明书编写）。"
-            outline: Optional[dict] = None
-            try:
-                parsed = json.loads(text)
-                if isinstance(parsed, dict):
-                    outline = parsed
-            except Exception:
-                m = re.search(r"\{.*\}", text, re.S)
-                if m:
-                    try:
-                        parsed = json.loads(m.group(0))
-                        if isinstance(parsed, dict):
-                            outline = parsed
-                    except Exception:
-                        pass
+            outline = parse_json_object(text)
             if outline is None:
                 return "save 收到的大纲不是合法 JSON 对象，请对照说明书重新整理后提交。"
             meta = outline.get("meta") if isinstance(outline.get("meta"), dict) else {}

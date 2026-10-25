@@ -18,6 +18,7 @@ from ..core import Sandbox
 from ..core.llmerrors import LLMCallError
 from ..core.textclean import deep_clean_sections
 from ..core.inject import assemble_injection
+from ..core.jsonutil import parse_json_loose, parse_json_object
 from ..prompts import (
     build_arc_summary_prompt,
     build_beat_expand_prompt,
@@ -628,21 +629,10 @@ class WriteMixin:
         chapter_info += f"\n用户写作要求：{instruction[:300]}"
         prompt = build_global_card_select_prompt(chapter_info=chapter_info, pool=pool)
         raw = await self._llm_chat(prompt, system_prompt="你只输出 JSON，不要输出任何其他文字。")
-        raw = self._clean(raw)
+        parsed = parse_json_object(self._clean(raw))
         selected: list[str] = []
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                selected = parsed.get("selected") or []
-        except Exception:
-            m = re.search(r"\{.*\}", raw, re.S)
-            if m:
-                try:
-                    parsed = json.loads(m.group(0))
-                    if isinstance(parsed, dict):
-                        selected = parsed.get("selected") or []
-                except Exception:
-                    pass
+        if isinstance(parsed, dict):
+            selected = parsed.get("selected") or []
         names = [str(n).strip() for n in selected if str(n).strip()][:3]
         if not names:
             return ""
@@ -939,20 +929,9 @@ class WriteMixin:
     @staticmethod
     def _parse_edit_json(raw: str) -> list[dict]:
         """容错解析 LLM 输出的编辑指令 JSON 数组（[{find, replace}, ...]）。"""
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, list):
-                return [e for e in parsed if isinstance(e, dict)]
-        except Exception:
-            pass
-        m = re.search(r"\[[\s\S]*\]", raw)
-        if m:
-            try:
-                parsed = json.loads(m.group(0))
-                if isinstance(parsed, list):
-                    return [e for e in parsed if isinstance(e, dict)]
-            except Exception:
-                pass
+        parsed = parse_json_loose(raw)
+        if isinstance(parsed, list):
+            return [e for e in parsed if isinstance(e, dict)]
         return []
 
     @staticmethod
@@ -1205,20 +1184,7 @@ class WriteMixin:
             return []
         prompt = build_beat_expand_prompt(chapter_outline=outline_text, instruction=instruction)
         raw = self._clean(await self._llm_chat(prompt, system_prompt="你只输出 JSON，不要输出任何其他文字。"))
-        data = None
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                data = parsed
-        except Exception:
-            m = re.search(r"\{.*\}", raw, re.S)
-            if m:
-                try:
-                    parsed = json.loads(m.group(0))
-                    if isinstance(parsed, dict):
-                        data = parsed
-                except Exception:
-                    pass
+        data = parse_json_object(raw)
         beats_raw = (data or {}).get("beats")
         if not isinstance(beats_raw, list) or len(beats_raw) < 2:
             return []
@@ -1263,48 +1229,32 @@ class WriteMixin:
         nxt_text = f"第{ch + 1}章要点：{nxt.get('summary', '')}\n情节节点：{'、'.join(nxt.get('plot_points') or [])}"
         prompt = build_outline_diverge_prompt(chapter_summary=str(cur.get("summary")), next_outline=nxt_text)
         raw = self._clean(await self._llm_chat(prompt, system_prompt="你只输出 JSON，不要输出任何其他文字。"))
-        data = None
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                data = parsed
-        except Exception:
-            m = re.search(r"\{.*\}", raw, re.S)
-            if m:
-                try:
-                    parsed = json.loads(m.group(0))
-                    if isinstance(parsed, dict):
-                        data = parsed
-                except Exception:
-                    pass
+        data = parse_json_object(raw)
         if data and data.get("diverge") and str(data.get("note") or "").strip():
             return f"【动态修订提示】{str(data['note'])[:80]}"
         return ""
 
     async def _update_story_state(self, sandbox: Sandbox, work: str, chapter: str, ch: int) -> str:
-        """用新章节覆盖更新设定书；解析失败保留旧设定书并提示。"""
+        """用新章节覆盖更新设定书（交接 §5-9 健壮化）：
+        旧状态压缩防输出截断、宽松 JSON 提取（围栏/前后杂文/尾逗号/截断修复）、
+        解析失败自动严格重试一次、顶层缺键回退旧值；仍失败才保留旧设定书。"""
         old = sandbox.load_story_state(work)
         old_meta = old.get("meta") if isinstance(old.get("meta"), dict) else {}
-        old_str = json.dumps(old, ensure_ascii=False, indent=2)
-        prompt = build_story_state_prompt(old_state=old_str, chapter=chapter[:4000])
-        raw = await self._llm_chat(prompt, system_prompt="你只输出 JSON，不要输出其他文字。")
-        raw = self._clean(raw)
+        prompt = build_story_state_prompt(
+            old_state=self._compact_state_for_prompt(old), chapter=chapter[:4000])
         state: Optional[dict] = None
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                state = parsed
-        except Exception:
-            m = re.search(r"\{.*\}", raw, re.S)
-            if m:
-                try:
-                    parsed = json.loads(m.group(0))
-                    if isinstance(parsed, dict):
-                        state = parsed
-                except Exception:
-                    pass
+        for attempt in range(2):
+            sys_prompt = "你只输出 JSON，不要输出其他文字。" if attempt == 0 else (
+                "你只输出一个 JSON 对象本身：以 { 开头、以 } 结束；"
+                "禁止 Markdown 代码块围栏，禁止任何解释、说明或前后缀文字。")
+            raw = await self._llm_chat(prompt, system_prompt=sys_prompt)
+            state = parse_json_object(self._clean(raw))
+            if state is not None:
+                break
+            logger.warning(f"[沙盒] 设定书更新第 {attempt + 1} 次输出无法解析（work={work} ch={ch}）")
         if state is None:
-            return "（设定书更新失败：模型输出无法解析，已保留旧设定书。）"
+            return "（设定书更新失败：模型输出两次均无法解析，已保留旧设定书。）"
+        state = self._merge_story_state(old, state)
         if "meta" not in state or not isinstance(state.get("meta"), dict):
             state["meta"] = {}
         state["meta"]["current_chapter"] = ch
@@ -1313,25 +1263,37 @@ class WriteMixin:
         sandbox.save_story_state(work, state)
         return "（设定书已更新）"
 
+    @staticmethod
+    def _compact_state_for_prompt(state: dict, cap: int = 400) -> str:
+        """旧设定书进提示词前压缩：字符串截到 cap 字。设定书文件保持完整，
+        只减小输入体积、给输出留预算，降低模型复制长文导致的截断概率。"""
+        def trim(v):
+            if isinstance(v, str):
+                return v[:cap] + ("…" if len(v) > cap else "")
+            if isinstance(v, list):
+                return [trim(x) for x in v]
+            if isinstance(v, dict):
+                return {k: trim(x) for k, x in v.items()}
+            return v
+        return json.dumps(trim(state), ensure_ascii=False, indent=2)
+
+    @staticmethod
+    def _merge_story_state(old: dict, parsed: dict) -> dict:
+        """解析结果覆盖旧设定书；解析缺失或为 null 的顶层键回退旧值——
+        防模型漏字段或输出被截断丢数据；显式空数组仍视为有意清空。"""
+        state = dict(parsed)
+        for key in ("world", "characters", "foreshadowing", "unresolved", "meta"):
+            if state.get(key) is None:
+                old_v = old.get(key)
+                if old_v is not None:
+                    state[key] = old_v
+        return state
+
     async def _extract_characters(self, text: str) -> list[dict]:
         """统计正文角色出现频次与置信度；返回角色列表（已按提示词判定线过滤）。"""
         prompt = build_character_extract_prompt(text=text[:6000])
         raw = await self._llm_chat(prompt, system_prompt="你只输出 JSON，不要输出任何其他文字。")
-        raw = self._clean(raw)
-        data = None
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                data = parsed
-        except Exception:
-            m = re.search(r"\{.*\}", raw, re.S)
-            if m:
-                try:
-                    parsed = json.loads(m.group(0))
-                    if isinstance(parsed, dict):
-                        data = parsed
-                except Exception:
-                    pass
+        data = parse_json_object(self._clean(raw))
         if not data:
             return []
         items = data.get("characters") or []
@@ -1385,21 +1347,7 @@ class WriteMixin:
             try:
                 prompt = build_character_prompt(description=desc, reference=reference)
                 raw = await self._llm_chat(prompt, system_prompt="你只输出 JSON，不要输出任何其他文字。")
-                card = None
-                raw = self._clean(raw)
-                try:
-                    parsed = json.loads(raw)
-                    if isinstance(parsed, dict):
-                        card = parsed
-                except Exception:
-                    m = re.search(r"\{.*\}", raw, re.S)
-                    if m:
-                        try:
-                            parsed = json.loads(m.group(0))
-                            if isinstance(parsed, dict):
-                                card = parsed
-                        except Exception:
-                            pass
+                card = parse_json_object(self._clean(raw))
                 if card is None:
                     continue
                 basic = card.get("basic") if isinstance(card.get("basic"), dict) else {}

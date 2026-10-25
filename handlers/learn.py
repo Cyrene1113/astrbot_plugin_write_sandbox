@@ -7,6 +7,7 @@ import time
 from astrbot.api.event import AstrMessageEvent, filter
 
 from ..core import LIBRARY_DIR_NAME
+from ..core.jsonutil import parse_json_object
 from ..prompts import build_learn_prompt
 from .base import _pack_sources
 
@@ -53,22 +54,10 @@ class LearnMixin:
         favorites_txt = _pack_sources(favs) or "（无）"
         library_txt = _pack_sources(libs) or "（无）"
         prompt = build_learn_prompt(favorites=favorites_txt, library=library_txt)
-        raw = await self._llm_chat(prompt, system_prompt="你只输出 JSON，不要输出任何其他文字。")
-        raw = self._clean(raw)
-        try:
-            card = json.loads(raw)
-            if not isinstance(card, dict):
-                raise ValueError("不是 JSON 对象")
-        except Exception:
-            # 尝试提取第一个 { } 块
-            m = re.search(r"\{.*\}", raw, re.S)
-            if m:
-                try:
-                    card = json.loads(m.group(0))
-                except Exception:
-                    return "风格卡解析失败了，请再试一次，或检查素材格式。"
-            else:
-                return "风格卡解析失败了，请再试一次，或检查素材格式。"
+        card = parse_json_object(self._clean(await self._llm_chat(
+            prompt, system_prompt="你只输出 JSON，不要输出任何其他文字。")))
+        if card is None:
+            return "风格卡解析失败了，请再试一次，或检查素材格式。"
 
         # 用实际学习到的素材份数校正 meta，避免模型按被截断的输入误填
         meta = card.get("meta") if isinstance(card.get("meta"), dict) else {}

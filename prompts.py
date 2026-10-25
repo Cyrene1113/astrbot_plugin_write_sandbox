@@ -130,12 +130,16 @@ CHAPTER_SUMMARY_PROMPT = """你是剧情摘要员。任务：把下面的「新�
 # 长文：设定书更新（覆盖更新，当前状态快照）
 STORY_STATE_PROMPT = """你是设定书管理员。根据「旧设定书」与「新章节」，输出更新后的设定书。
 
+【输出纪律（违反即废件）】
+- 只输出一个 JSON 对象本身：以 { 开头、以 } 结束。
+- 禁止 Markdown 代码块围栏（```）、禁止任何解释、说明或前后缀文字。
+- 五个顶层键（meta/world/characters/foreshadowing/unresolved）一个都不能少；某个键本次没有变化也要原样带上，不许省略。
+
 要求：
-- 以 JSON 输出，不要输出其他文字。
 - 字段固定：meta(标题/current_chapter)、world(世界观，dict)、characters(角色数组，每项 name/状态/关系/秘密)、foreshadowing(伏笔数组，每项 desc/status=未收或已收)、unresolved(未解决问题数组)。
 - 「已经过去的事」不要写进设定书（那属于章节摘要）；只记录「现在仍然成立的状态」。
 - 状态变化用覆盖更新：人物新状态替换旧状态；伏笔触发则 status 改为已收。
-- 无法判断的字段保留旧值或空。
+- 精炼为要：world 与人物条目各控制在一两句话内，不复制旧文长段。
 
 【旧设定书】
 {old_state}

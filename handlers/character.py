@@ -8,6 +8,7 @@ from typing import Optional
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 
+from ..core.jsonutil import parse_json_object
 from ..prompts import build_character_guide, build_character_prompt
 from .base import _pack_sources
 
@@ -164,20 +165,7 @@ class CharacterMixin:
         if action == "save":
             if not text.strip():
                 return "save 需要把人设卡 JSON 放进 text 参数（照着 action=create 返回的说明书编写）。"
-            card: Optional[dict] = None
-            try:
-                parsed = json.loads(text)
-                if isinstance(parsed, dict):
-                    card = parsed
-            except Exception:
-                m = re.search(r"\{.*\}", text, re.S)
-                if m:
-                    try:
-                        parsed = json.loads(m.group(0))
-                        if isinstance(parsed, dict):
-                            card = parsed
-                    except Exception:
-                        pass
+            card = parse_json_object(text)
             if card is None:
                 return "save 收到的人设卡不是合法 JSON 对象，请对照说明书重新整理后提交。"
             basic = card.get("basic") if isinstance(card.get("basic"), dict) else {}
@@ -318,21 +306,7 @@ class CharacterMixin:
             desc = f"{nm}，{role_hint}。{traits}" if traits else f"{nm}，{role_hint}。"
             prompt = build_character_prompt(description=desc, reference=reference)
             raw = await self._llm_chat(prompt, system_prompt="你只输出 JSON，不要输出任何其他文字。")
-            card = None
-            raw = self._clean(raw)
-            try:
-                parsed = json.loads(raw)
-                if isinstance(parsed, dict):
-                    card = parsed
-            except Exception:
-                m = re.search(r"\{.*\}", raw, re.S)
-                if m:
-                    try:
-                        parsed = json.loads(m.group(0))
-                        if isinstance(parsed, dict):
-                            card = parsed
-                    except Exception:
-                        pass
+            card = parse_json_object(self._clean(raw))
             if card is None:
                 skipped.append(f"{nm}(解析失败)")
                 continue
