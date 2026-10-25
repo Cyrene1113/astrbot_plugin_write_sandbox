@@ -33,6 +33,7 @@
 | --- | --- |
 | 写一段…… / 续写 / 改写上一段 | 按当前风格卡 + 约束生成文字，落盘 txt，写完推送 |
 | 这段太短 / 太长 / 换第一人称 / 节奏快一点 | 调整对应约束项，下次生成立即生效 |
+| 给《XX》单独定约束（节奏/描写偏好/长度等） | sandbox_settings 传 work 参数写入作品级约束；写作时作品级覆盖全局同名项并标「（作品级）」，其他作品不受影响 |
 | 这段好，收藏 | 存为高权重样本，以后风格学习优先参考 |
 | 学一下这些素材的风格 | 从素材库提炼风格卡，之后都按这个味道写 |
 | 写《XX》第 3 章 | 进入长篇模式，自动维护章节摘要和设定书 |
@@ -49,6 +50,8 @@
 ## 🧠 它怎么工作（了解一下更好用）
 
 - 每次生成 = 系统提示词 + 风格卡 + 约束 + 沙盒历史 + 你这次的指令
+- 约束分三层：章节指令 > 作品级 > 全局，同名键就近覆盖、其余透传，作品之间互不串味
+- 完稿自动文风校验：代词密度只进报告提示；段尾升华 ≥2 处自动做一轮定向修订，修订双轨落盘留痕（内容一致覆盖原文件，有差异另存修订版）
 - 沙盒历史独立保存，写长文时不会和日常聊天串味
 - 长文自动分节后台生成，中途随时可问进度
 - LLM 调用改为流式 + 空闲超时：慢而正常的生成不再被误杀，失败会报出超时/限流/上下文超限等真实原因
@@ -125,12 +128,14 @@ python scripts/migrate_v1_v2.py --apply --data-root data/plugin_data/astrbot_plu
 astrbot_plugin_write_sandbox/
 ├── main.py            # AstrBot 入口与工具注册
 ├── handlers/          # 业务逻辑（6 个 Mixin：base / write / outline / character / learn / misc）
-├── core/              # 沙盒核心包（analysis / cardops / characters / cleanup / constants / library / llmerrors / outlineops / sandbox / storage / style / textclean / works）
+├── core/              # 沙盒核心包（analysis / cardops / characters / cleanup / constants / constraintops / library / llmerrors / outlineops / prosecheck / sandbox / storage / style / textclean / works）
 ├── prompts.py         # 提示词模板
 ├── scripts/
 │   └── migrate_v1_v2.py  # 存量人设卡 v1→v2 迁移（默认 dry-run 只出报告，--apply 实迁，见「🔄 存量卡迁移到 v2」）
 ├── tests/
-│   └── test_p0.py     # P0 稳定性单测（python tests/test_p0.py 直接跑，无需装依赖）
+│   ├── test_p0.py     # P0 稳定性单测（python tests/test_p0.py 直接跑，无需装依赖）
+│   ├── test_p1.py     # P1 人设卡 v2/合并/元视角单测（python tests/test_p1.py）
+│   └── test_p2.py     # P2 约束三层/文风校验单测（python tests/test_p2.py）
 ├── _conf_schema.yaml  # 引擎参数配置（WebUI 插件配置页可见，见上文「⚙️ 引擎配置」）
 ├── metadata.yaml      # 插件元信息
 └── PLAN.md            # 开发方案（需求变更先改这里）

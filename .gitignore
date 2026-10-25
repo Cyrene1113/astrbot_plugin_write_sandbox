@@ -24,3 +24,4 @@ Thumbs.db
 
 # 迁移脚本报告（migrate_v1_v2.py 本地产物）
 scripts/migration_report.md
+.mimosa/
