@@ -193,6 +193,22 @@ class WriteMixin:
         except Exception as e:
             logger.warning(f"[沙盒] 任务状态落盘失败: {e}")
 
+    def _persist_prose_revision(self, job: dict, old_text: str, new_text: str) -> None:
+        """文风修订落盘：与哨兵修订同款双轨（内容一致则覆盖原文件，否则另存）。"""
+        try:
+            if job.get("file_path"):
+                fp = Path(job["file_path"])
+                if fp.exists():
+                    cur = fp.read_text(encoding="utf-8").rstrip()
+                    if cur == old_text.rstrip():
+                        fp.write_text(new_text.rstrip() + "\n", encoding="utf-8")
+                    else:
+                        rev = fp.with_name(fp.stem + "_文风修订版" + fp.suffix)
+                        rev.write_text(new_text.rstrip() + "\n", encoding="utf-8")
+                        job["prose_rev_path"] = str(rev)
+        except Exception as e:
+            logger.warning(f"文风修订落盘失败: {e}")
+
     @classmethod
     def _parse_chapter_no(cls, text: str) -> int:
         """从「重写第8章」「第八章」「第 12 章」等指令里解析目标章号；解析不到返回 0。"""
@@ -496,6 +512,39 @@ class WriteMixin:
                     job["meta_leak_report"] = (job.get("meta_leak_report", "") + "\n" + extra).strip()
             except Exception as e:
                 logger.warning(f"元视角哨兵失败: {e}")
+            # 文风校验闭环（P2）：代词密度只报告；段尾升华 ≥2 处触发一轮定向修订
+            try:
+                from ..core.prosecheck import check_prose
+                checked_text = revised if job.get("revise_report") else full_text
+                rep = check_prose(checked_text)
+                sub = rep["sublimation"]
+                pro = rep["pronoun"]
+                notes = []
+                if pro["per_kilo"] >= 8:
+                    notes.append(f"代词密度 {pro['per_kilo']} 次/千字（他×{pro['he']} 她×{pro['she']}），偏高，建议后续章节多用称呼/身份词")
+                if len(sub) >= 2:
+                    bundle = "\n".join(f"第{h['no']}段末句：{h['tail']}" for h in sub[:8])
+                    prompt = (
+                        "你是小说编辑。下面正文被检测出段尾升华（在段末强行抒情/点题/讲道理），"
+                        "请把每处改写成「停在动作或事实上」的收法，不删段、不改剧情。\n"
+                        "输出 JSON 数组（不要输出其他文字），每项："
+                        "{\"find\": \"正文里能唯一找到的连续原文片段\", \"replace\": \"替换后的文本\"}\n"
+                        "find 必须逐字存在且全文唯一；最多 8 条。\n\n"
+                        f"【检出的段尾句】\n{bundle}\n\n【全文】\n{checked_text[:20000]}"
+                    )
+                    raw = await self._llm_chat(prompt, system_prompt="你只输出 JSON 数组，不要输出任何其他文字。")
+                    edits = self._parse_edit_json(self._clean(raw))
+                    if edits:
+                        new_text, applied, _sk = self._apply_edits(checked_text, edits)
+                        if applied:
+                            notes.append(f"段尾升华 {len(sub)} 处，已自动修订 {applied} 处")
+                            self._persist_prose_revision(job, checked_text, new_text)
+                elif sub:
+                    notes.append(f"段尾升华 1 处（第{sub[0]['no']}段），未达自动修订线，仅提示")
+                if notes:
+                    job["prose_report"] = "【文风校验】" + "；".join(notes) + "。"
+            except Exception as e:
+                logger.warning(f"文风校验失败: {e}")
             await self._notify(job, failed=False)
         except Exception as e:
             logger.error(f"后台写作任务 {job.get('job_id')} 异常: {e}")
@@ -577,7 +626,7 @@ class WriteMixin:
         ) if history else "（暂无历史，这是沙盒中的第一段。）"
 
         # 指令里有明确字数时，覆盖默认 length 约束，防止「300~800字」压制篇幅
-        constraints_text = sandbox.render_constraints()
+        constraints_text = sandbox.render_layered_constraints(work)
         target = self._parse_target_chars(f"{instruction}\n{constraints_text}")
         if target > 0:
             constraints_text = re.sub(
@@ -592,6 +641,7 @@ class WriteMixin:
             history=history_text,
             instruction=instruction,
             story_context=story_context,
+            style_fewshot=sandbox.render_style_fewshot(work=work),
         )
 
         # 分节说明：让模型知道当前在第几节、目标长度、是否收尾
@@ -808,6 +858,10 @@ class WriteMixin:
                     body += "\n\n" + job["meta_leak_report"]
                 if job.get("meta_clean_path"):
                     body += f"\n元视角清理版另存：{job['meta_clean_path']}"
+                if job.get("prose_report"):
+                    body += "\n\n" + job["prose_report"]
+                if job.get("prose_rev_path"):
+                    body += f"\n文风修订版另存：{job['prose_rev_path']}"
                 for w in job.get("post_warnings") or []:
                     body += f"\n⚠️ {w}"
                 chunk = job.get("current_chunk") or ""
