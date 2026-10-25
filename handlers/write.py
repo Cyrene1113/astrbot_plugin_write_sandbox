@@ -17,12 +17,16 @@ from astrbot.api.message_components import Plain
 from ..core import Sandbox
 from ..core.llmerrors import LLMCallError
 from ..core.textclean import deep_clean_sections
+from ..core.inject import assemble_injection
 from ..prompts import (
+    build_arc_summary_prompt,
+    build_beat_expand_prompt,
     build_chapter_summary_prompt,
     build_character_extract_prompt,
     build_character_prompt,
     build_context_snippet,
     build_global_card_select_prompt,
+    build_outline_diverge_prompt,
     build_revise_text_prompt,
     build_story_state_prompt,
     build_system_prompt,
@@ -369,22 +373,35 @@ class WriteMixin:
             cfg = sandbox.load_story_config(work) if work else {}
             inject_memory = bool(cfg.get("inject_memory", True)) if work else True
             inject_chars = bool(cfg.get("inject_characters", True)) if work else True
-            story_context = sandbox.render_story_memory(work) if (work and inject_memory) else ""
+            budget = int(cfg.get("inject_char_budget", 12000) or 0)
+            focus = sandbox.chapter_character_names(work, ch) if work else []
+            mem_text = sandbox.render_story_memory(work, focus_chars=focus) if (work and inject_memory) else ""
             chapter_outline = sandbox.render_chapter_outline(work, ch) if work else ""
-            if chapter_outline:
-                story_context = (story_context + "\n\n" + chapter_outline) if story_context else chapter_outline
-            if work and inject_chars:
-                work_chars = sandbox.render_work_characters(work, ch) if work else ""
-                if work_chars:
-                    story_context = (story_context + "\n\n" + work_chars) if story_context else work_chars
-            # 全局卡智能选角：按本章剧情需要自动挑选，不点名、不全带
+            work_chars = sandbox.render_work_characters(work, ch) if (work and inject_chars) else ""
+            picked = ""
             if work and inject_chars:
                 try:
                     picked = await self._select_global_cards(sandbox, work, ch, instruction, chapter_outline)
-                    if picked:
-                        story_context = (story_context + "\n\n" + picked) if story_context else picked
                 except Exception as e:
                     logger.warning(f"全局卡智能选角失败，跳过: {e}")
+            story_context = assemble_injection(
+                [(0, "本章大纲", chapter_outline), (1, "出场角色卡", work_chars),
+                 (1, "选角卡", picked), (2, "长文记忆", mem_text)],
+                budget,
+            )
+            # 场景 beat 细纲（P3）：generate + use_beats + 本章有大纲节点时自动展开；
+            # 失败/无大纲一律回退现有分节模式
+            beats: list[dict] = []
+            if work and mode == "generate" and cfg.get("use_beats", True):
+                try:
+                    beats = await self._ensure_chapter_beats(sandbox, work, ch, instruction)
+                except Exception as e:
+                    logger.warning(f"beat 细纲展开失败，回退分节模式: {e}")
+            if beats:
+                job["beats"] = beats
+            if beats:
+                total = len(beats)
+                job["section_total"] = total
             parts_written: list[str] = resume_parts
             file_path = None
 
@@ -445,6 +462,27 @@ class WriteMixin:
                 state_msg = await self._update_story_state(sandbox, work, full, final_ch)
                 if "失败" in state_msg:
                     job.setdefault("post_warnings", []).append(state_msg)
+                # 摘要分层归档（P3）：未归档摘要超阈值 → 最老一批压成弧线摘要
+                try:
+                    to_arch = sandbox.pick_to_archive(work)
+                    if to_arch:
+                        arc_text = await self._arc_compress(sandbox, work, to_arch)
+                        if arc_text:
+                            sandbox.save_arc_summary(work, to_arch[0], to_arch[-1], arc_text)
+                            sandbox.mark_summaries_archived(work, to_arch)
+                            job.setdefault("post_warnings", []).append(
+                                f"早期第{to_arch[0]}~{to_arch[-1]}章摘要已归档为弧线摘要")
+                except Exception as e:
+                    logger.warning(f"摘要归档失败: {e}")
+                # 大纲动态偏离提示（P3）：只挂便签，不改大纲（沿用确认制）
+                try:
+                    diverge = await self._check_outline_diverge(sandbox, work, final_ch)
+                    if diverge:
+                        sandbox.add_outline_mood(work, final_ch + 1, diverge)
+                        job.setdefault("post_warnings", []).append(
+                            f"第{final_ch + 1}章大纲疑似与已写内容偏离，已挂灵感便签提示（view 可查）")
+                except Exception as e:
+                    logger.warning(f"大纲偏离检查失败: {e}")
                 # 自动提炼人设卡：受作品级 auto_extract 开关控制（默认关）
                 # 开启后只给「多章累计反复出现」的角色建卡，单章一次性龙套跳过
                 if sandbox.load_story_config(work).get("auto_extract", False):
@@ -619,6 +657,7 @@ class WriteMixin:
         mode = job["mode"]
         work = job.get("work") or ""
         ch = int(job.get("chapter_no") or 0)
+        beats = job.get("beats") or []
         history = sandbox.load_history()
         history_text = "\n".join(
             f"{'用户' if h['role'] == 'user' else '沙盒'}: {h['content'][:300]}"
@@ -647,7 +686,17 @@ class WriteMixin:
         # 分节说明：让模型知道当前在第几节、目标长度、是否收尾
         dynamic = target <= 0
         per_section = math.ceil(target / total) if target > 0 else self._SECTION_TARGET_CHARS
-        if dynamic:
+        beat = beats[idx - 1] if beats and 0 < idx <= len(beats) else None
+        if beat is not None:
+            goal = int(beat.get("goal_chars") or 0) or self._SECTION_TARGET_CHARS
+            per_section = goal
+            section_note = (
+                f"\n\n【场景 beat】第 {idx}/{len(beats)} 拍｜场景：{beat.get('scene', '')}\n"
+                f"- 本拍要完成：{beat.get('turn', '')}\n"
+                f"- 承接：{beat.get('carry') or '紧接上一拍结尾'}\n"
+                f"- 本拍写到约 {goal} 字即收，不提前收尾全章。"
+            )
+        elif dynamic:
             section_note = (
                 f"\n\n【分节写作】本次不预设总节数与总长，由剧情自然推进。"
                 f"现在写第 {idx} 节，写到本节自然段落即可停笔。"
@@ -1127,6 +1176,93 @@ class WriteMixin:
         if len(summary) > 320:
             summary = summary[:320]
         return summary
+
+    async def _ensure_chapter_beats(self, sandbox: Sandbox, work: str, ch: int,
+                                    instruction: str) -> list[dict]:
+        """取/生成本章 beat 细纲。已有直接返回；无大纲节点或无 plot_points 返回 []。"""
+        stored = sandbox.get_chapter_beats(work, ch)
+        if stored:
+            return stored
+        outline_text = sandbox.render_chapter_outline(work, ch)
+        if "（大纲里还没有这一章的节点" in outline_text or "情节节点" not in outline_text:
+            return []
+        prompt = build_beat_expand_prompt(chapter_outline=outline_text, instruction=instruction)
+        raw = self._clean(await self._llm_chat(prompt, system_prompt="你只输出 JSON，不要输出任何其他文字。"))
+        data = None
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                data = parsed
+        except Exception:
+            m = re.search(r"\{.*\}", raw, re.S)
+            if m:
+                try:
+                    parsed = json.loads(m.group(0))
+                    if isinstance(parsed, dict):
+                        data = parsed
+                except Exception:
+                    pass
+        beats_raw = (data or {}).get("beats")
+        if not isinstance(beats_raw, list) or len(beats_raw) < 2:
+            return []
+        beats: list[dict] = []
+        for b in beats_raw[:8]:
+            if not isinstance(b, dict) or not str(b.get("scene") or "").strip():
+                continue
+            beats.append({
+                "scene": str(b.get("scene"))[:80],
+                "goal_chars": max(300, min(int(b.get("goal_chars") or 0), 6000)),
+                "turn": str(b.get("turn") or "")[:60],
+                "carry": str(b.get("carry") or "")[:40],
+            })
+        if len(beats) < 2:
+            return []
+        sandbox.set_chapter_beats(work, ch, beats)
+        return beats
+
+    async def _arc_compress(self, sandbox: Sandbox, work: str, chs: list[int]) -> str:
+        """把待归档章节摘要压缩为一段弧线摘要；失败返回空串。"""
+        items = sandbox.load_chapter_summaries(work)
+        sel = [f"[第{it.get('ch')}章] {it.get('summary', '')}" for it in items
+               if int(it.get("ch", 0)) in set(chs)]
+        if not sel:
+            return ""
+        prompt = build_arc_summary_prompt(summaries="\n".join(sel))
+        raw = await self._llm_chat(prompt, system_prompt="你只输出摘要正文，不要输出其他文字。")
+        text = self._clean(raw)
+        return text[:320] if text else ""
+
+    async def _check_outline_diverge(self, sandbox: Sandbox, work: str, ch: int) -> str:
+        """刚写完第 ch 章后，检查下一章大纲是否被正文架空。返回提示语（无偏离/无法判断返回空串）。"""
+        outline = sandbox.load_outline(work)
+        nxt = next((it for it in (outline.get("chapters") or [])
+                    if isinstance(it, dict) and int(it.get("ch", 0)) == ch + 1), None)
+        if not nxt or not (nxt.get("summary") or nxt.get("plot_points")):
+            return ""
+        items = sandbox.load_chapter_summaries(work)
+        cur = next((it for it in items if int(it.get("ch", 0)) == ch), None)
+        if not cur or not str(cur.get("summary") or "").strip():
+            return ""
+        nxt_text = f"第{ch + 1}章要点：{nxt.get('summary', '')}\n情节节点：{'、'.join(nxt.get('plot_points') or [])}"
+        prompt = build_outline_diverge_prompt(chapter_summary=str(cur.get("summary")), next_outline=nxt_text)
+        raw = self._clean(await self._llm_chat(prompt, system_prompt="你只输出 JSON，不要输出任何其他文字。"))
+        data = None
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                data = parsed
+        except Exception:
+            m = re.search(r"\{.*\}", raw, re.S)
+            if m:
+                try:
+                    parsed = json.loads(m.group(0))
+                    if isinstance(parsed, dict):
+                        data = parsed
+                except Exception:
+                    pass
+        if data and data.get("diverge") and str(data.get("note") or "").strip():
+            return f"【动态修订提示】{str(data['note'])[:80]}"
+        return ""
 
     async def _update_story_state(self, sandbox: Sandbox, work: str, chapter: str, ch: int) -> str:
         """用新章节覆盖更新设定书；解析失败保留旧设定书并提示。"""
