@@ -115,6 +115,9 @@ python scripts/migrate_v1_v2.py --apply --data-root data/plugin_data/astrbot_plu
 
 - 每篇作品独立维护：逐章摘要 + 设定书 + 大纲
 - 写新章节时自动注入上一章的状态，故事线稳稳的
+- 大纲齐全的长章会自动拆成 3~6 个场景 beat 逐拍推进（作品配置 use_beats 可关）
+- 连载超 8 章后，最早一批逐章摘要自动压缩为一段弧线摘要，近 5 章保持全量，上下文不随章数膨胀
+- 写章注入的四块材料按优先级装进字符预算（默认 12000，0 不限），超限先丢最次要并留省略标注
 
 ## 🔒 隐私
 
@@ -128,14 +131,16 @@ python scripts/migrate_v1_v2.py --apply --data-root data/plugin_data/astrbot_plu
 astrbot_plugin_write_sandbox/
 ├── main.py            # AstrBot 入口与工具注册
 ├── handlers/          # 业务逻辑（6 个 Mixin：base / write / outline / character / learn / misc）
-├── core/              # 沙盒核心包（analysis / cardops / characters / cleanup / constants / constraintops / library / llmerrors / outlineops / prosecheck / sandbox / storage / style / textclean / works）
+├── core/              # 沙盒核心包（analysis / cardops / characters / cleanup / constants / constraintops / inject / library / llmerrors / outlineops / prosecheck / sandbox / storage / style / textclean / works）
 ├── prompts.py         # 提示词模板
 ├── scripts/
-│   └── migrate_v1_v2.py  # 存量人设卡 v1→v2 迁移（默认 dry-run 只出报告，--apply 实迁，见「🔄 存量卡迁移到 v2」）
+│   ├── migrate_v1_v2.py  # 存量人设卡 v1→v2 迁移（默认 dry-run 只出报告，--apply 实迁，见「🔄 存量卡迁移到 v2」）
+│   └── migrate_constraints.py  # 全局约束四键迁作品级（默认 dry-run，--apply 实迁）
 ├── tests/
 │   ├── test_p0.py     # P0 稳定性单测（python tests/test_p0.py 直接跑，无需装依赖）
 │   ├── test_p1.py     # P1 人设卡 v2/合并/元视角单测（python tests/test_p1.py）
-│   └── test_p2.py     # P2 约束三层/文风校验单测（python tests/test_p2.py）
+│   ├── test_p2.py     # P2 约束三层/文风校验单测（python tests/test_p2.py）
+│   └── test_p3.py     # P3 beat 细纲/摘要归档/注入预算单测（python tests/test_p3.py）
 ├── _conf_schema.yaml  # 引擎参数配置（WebUI 插件配置页可见，见上文「⚙️ 引擎配置」）
 ├── metadata.yaml      # 插件元信息
 └── PLAN.md            # 开发方案（需求变更先改这里）

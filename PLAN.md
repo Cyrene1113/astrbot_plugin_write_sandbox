@@ -60,6 +60,9 @@
 | 完稿元视角哨兵 | core/cardops.py detect_meta_sentences/scrub_meta_lines + handlers/write.py | 独立注记行自动剥除+落盘，叙述内嵌只报告进 meta_leak_report |
 | 约束三层 overlay | core/constraintops.py + core/works.py | 章节指令>作品级>全局，同名键就近覆盖、空值透传，渲染带「（作品级）」标注 |
 | 完稿文风校验闭环 | core/prosecheck.py + handlers/write.py | 代词密度 advisory 只进报告；段尾升华 ≥2 处经 _apply_edits 定向修订，双轨落盘 |
+| 场景 beat 细纲 | handlers/write.py + core/works.py + prompts.py | 大纲章节点自动展开 3~6 拍驱动分节，失败回退现有模式 |
+| 摘要分层归档 | core/works.py + core/inject.py | 未归档摘要超 8 章压最老一批为弧线摘要，只标记不删 |
+| 注入预算装配 | core/inject.py + handlers/write.py | story_context 四段按优先级装配，超预算丢最低项留省略标注 |
 
 ## 2. 功能代码导航
 
@@ -92,9 +95,12 @@ astrbot_plugin_write_sandbox/
 │   └── outlineops.py  ← 大纲分批合并与结构校验
 ├── tests/
 │   ├── test_p0.py     ← P0 纯函数单测（python tests/test_p0.py，无需依赖）
-│   └── test_p1.py     ← P1 纯函数+Sandbox 级单测（cardops schema v2/合并/元视角，python tests/test_p1.py，无需依赖）
+│   ├── test_p1.py     ← P1 纯函数+Sandbox 级单测（cardops schema v2/合并/元视角，无需依赖）
+│   ├── test_p2.py     ← P2 单测（prosecheck 文风/constraintops 三层约束，无需依赖）
+│   └── test_p3.py     ← P3 单测（inject 注入预算/归档挑选 + beats/弧线 Sandbox 级，无需依赖）
 ├── scripts/
-│   └── migrate_v1_v2.py ← 存量卡 v1→v2 迁移（默认 dry-run 只出报告，--apply 实迁留 .bak_v1；报告 migration_report.md 已 gitignore）
+│   ├── migrate_v1_v2.py ← 存量卡 v1→v2 迁移（默认 dry-run 只出报告，--apply 实迁留 .bak_v1；报告 migration_report.md 已 gitignore）
+│   └── migrate_constraints.py ← 全局约束四键迁作品级（默认 dry-run，--apply 实迁留 .bak_p2）
 ├── _conf_schema.yaml  ← 引擎参数配置（注入 BaseMixin._ENGINE）
 ├── prompts.py         ← 提示词模板 + 三份说明书
 ├── metadata.yaml
@@ -115,23 +121,24 @@ astrbot_plugin_write_sandbox/
 | LLM 调用/超时/任务续跑 | handlers/base.py + handlers/write.py + core/llmerrors.py | python tests/test_p0.py + py_compile |
 | 提示词/说明书 | prompts.py | lint + 生成冒烟 |
 | 约束三层/文风校验/提示词 | core/constraintops.py + core/prosecheck.py + core/works.py + handlers/write.py + prompts.py | python tests/test_p2.py + 模板字符数断言 + 迁移 dry-run |
+| beat/归档/预算 | core/inject.py + core/works.py + handlers/write.py + prompts.py | python tests/test_p3.py + py_compile |
 
 ## 3. 未完成的未来任务
 
 | 任务 | 内容 | 验收标准 |
 |------|------|---------|
-| P3 长文质量（评估方案 §四 P3） | 章→场景 beat 细纲、大纲动态修订（DOC 式）、摘要分层（近 3 章详摘+弧线压缩）、per-character 当前状态、注入 token 预算 | 10 章以上连载人设/伏笔一致性可查；百章级作品注入上下文规模稳定 |
 | 素材动态检索（二期） | 素材量大后切块向量化入 knowledge_base，按主题检索 few-shot（原第 5 节方式B） | 素材量触发后风格仍稳定、省 token |
 | 上百章早期弧线归档 | 已完结早期弧线的摘要一次性归档，只归档一次不进循环（原 9.1 扩展点） | 上百章长文上下文不爆，旧弧线信息不丢 |
 
 ## 4. 最近改动小尾巴
 
-1. 2026-10-24 P2 约束与提示词改造【汐小姐要求】：新增 core/prosecheck.py + core/constraintops.py 纯函数、约束三层 overlay（sandbox_settings 传 work 参数写作品级约束，章节指令>作品级>全局，同名就近覆盖空值透传）+ 存量迁移脚本 scripts/migrate_constraints.py（description_focus/rhythm/length/perspective 四键迁作品级，默认 dry-run、全局留 .bak）、系统提示词瘦身（1313→429 字符，-67%）、风格示范 few-shot 注入（激活卡/组合卡收藏样本首段 ≤500 字）、完稿文风校验闭环（代词密度 advisory 进报告；段尾升华 ≥2 处自动一轮定向修订，双轨落盘）、修复 style.py 缺 DEFAULT_STYLE_CARD 导入（无卡用户 NameError 隐患），新增 tests/test_p2.py，版本 0.5.0。【补记】同日 --apply 已执行：四键迁入《返场》story_constraints.json、全局恢复默认（scale/banned_words/keep_persona 留全局）、constraints.json.bak_p2 备份留存、复跑幂等
-2. 2026-10-24 P1 角色卡 schema v2 与剧情解耦【汐小姐要求】：卡 schema v2（persona 段+示例台词+inferred 演绎标注+canonical_id）、剧情退出人设卡（arc/plot_hooks 迁设定书）、写作注入裁剪（secrets/relations.note/剧情字段不进写作上下文，示例台词必注入）、完稿元视角哨兵（独立注记行自动剥除+落盘，叙述内嵌只报告进 meta_leak_report）、sandbox_character action=merge 身份合并（别名吸收/空位互补/大纲出场名单同步）、存量卡迁移脚本 scripts/migrate_v1_v2.py（默认 dry-run 只出报告、--apply 实迁且源卡留 .bak_v1 备份，全局卡剧情字段进 migration_dropped.json），新增 core/cardops.py、tests/test_p1.py，版本 0.4.0。【补记】同日 --apply 已执行：16 卡全部 v2（备份 *.json.bak_v1）、设定书收编 10 arc+23 伏笔、两张汐卡 role 章号残留已清；备份命名后缀在后防 glob 污染（95352cc）；P0/P1 均已快进合并 main（未 push），真机冒烟与 merge 汐双卡待跑
-3. 2026-10-24 P0 稳定性改造【汐小姐要求】：_llm_chat 流式化+空闲超时+错误分类（超时/限流/上下文超限可辨）、引擎参数配置化（每节 4000→2000）、大纲 save_batch 分批收单+confirm 严格校验、写作任务 jobs.json 落盘+resume 断点续跑、完稿深层清洗（分节标题/状态标记/注记行剥离，存量走 sandbox_cleanup scrub），新增 core/llmerrors.py、core/textclean.py、core/outlineops.py、tests/test_p0.py、_conf_schema.yaml，版本 0.3.0
-4. 2026-09-27 修复口水词哨兵失效【汐小姐要求】：core/analysis.py `_extract_dialogues`、core/library.py `_read_sources`/`_read_texts` 三个方法在模块化拆分后丢失 `@staticmethod` 装饰器（无 self 亦无装饰器），经 `self.xxx()` 实例调用即 TypeError，且被 write.py 的 try/except 静默吞掉，导致完稿哨兵「检测+自动修订」整条链路不生效。补回 `@staticmethod` 后恢复；已对 Sandbox 全方法做签名级体检 + 全域冒烟通过。
-5. 2026-09-25 风格卡作品级绑定 + 注入/提炼三开关（inject_memory/inject_characters/auto_extract）+ 角色卡提取收紧 0.6/3
-6. 2026-09-25 main.py → handlers/ 包拆分（Mixin 式，56c205b）
-7. 2026-09-21 局部修改优化：正文 mode=revise + 角色卡/大纲说明书模式
-8. 2026-09-21 core.py → core/ 包拆分（Mixin 式）
-9. 2026-09-13 写作体验小部件：章节接续 / 废稿清理 / 口水词哨兵 / 灵感便签
+1. 2026-10-24 P3 长文质量改造【汐小姐要求】：core/inject.py 纯函数（assemble_injection 注入预算装配/pick_to_archive 归档挑选）、场景 beat 细纲（章节点自动展开 3~6 拍驱动分节，use_beats 可关、失败回退）、摘要分层归档（>8 章压弧线摘要 arc_summaries.json，只标记不删）、render_story_memory 重构（弧线+近章+world 200 字截断+focus_chars 焦点角色）、大纲偏离便签（只提示不改大纲，沿用确认制）、inject_char_budget 注入预算（config 支持整数键）、新增 tests/test_p3.py，版本 0.6.0
+2. 2026-10-24 P2 约束与提示词改造【汐小姐要求】：新增 core/prosecheck.py + core/constraintops.py 纯函数、约束三层 overlay（sandbox_settings 传 work 参数写作品级约束，章节指令>作品级>全局，同名就近覆盖空值透传）+ 存量迁移脚本 scripts/migrate_constraints.py（description_focus/rhythm/length/perspective 四键迁作品级，默认 dry-run、全局留 .bak）、系统提示词瘦身（1313→429 字符，-67%）、风格示范 few-shot 注入（激活卡/组合卡收藏样本首段 ≤500 字）、完稿文风校验闭环（代词密度 advisory 进报告；段尾升华 ≥2 处自动一轮定向修订，双轨落盘）、修复 style.py 缺 DEFAULT_STYLE_CARD 导入（无卡用户 NameError 隐患），新增 tests/test_p2.py，版本 0.5.0。【补记】同日 --apply 已执行：四键迁入《返场》story_constraints.json、全局恢复默认（scale/banned_words/keep_persona 留全局）、constraints.json.bak_p2 备份留存、复跑幂等
+3. 2026-10-24 P1 角色卡 schema v2 与剧情解耦【汐小姐要求】：卡 schema v2（persona 段+示例台词+inferred 演绎标注+canonical_id）、剧情退出人设卡（arc/plot_hooks 迁设定书）、写作注入裁剪（secrets/relations.note/剧情字段不进写作上下文，示例台词必注入）、完稿元视角哨兵（独立注记行自动剥除+落盘，叙述内嵌只报告进 meta_leak_report）、sandbox_character action=merge 身份合并（别名吸收/空位互补/大纲出场名单同步）、存量卡迁移脚本 scripts/migrate_v1_v2.py（默认 dry-run 只出报告、--apply 实迁且源卡留 .bak_v1 备份，全局卡剧情字段进 migration_dropped.json），新增 core/cardops.py、tests/test_p1.py，版本 0.4.0。【补记】同日 --apply 已执行：16 卡全部 v2（备份 *.json.bak_v1）、设定书收编 10 arc+23 伏笔、两张汐卡 role 章号残留已清；备份命名后缀在后防 glob 污染（95352cc）；P0/P1 均已快进合并 main（未 push），真机冒烟与 merge 汐双卡待跑
+4. 2026-10-24 P0 稳定性改造【汐小姐要求】：_llm_chat 流式化+空闲超时+错误分类（超时/限流/上下文超限可辨）、引擎参数配置化（每节 4000→2000）、大纲 save_batch 分批收单+confirm 严格校验、写作任务 jobs.json 落盘+resume 断点续跑、完稿深层清洗（分节标题/状态标记/注记行剥离，存量走 sandbox_cleanup scrub），新增 core/llmerrors.py、core/textclean.py、core/outlineops.py、tests/test_p0.py、_conf_schema.yaml，版本 0.3.0
+5. 2026-09-27 修复口水词哨兵失效【汐小姐要求】：core/analysis.py `_extract_dialogues`、core/library.py `_read_sources`/`_read_texts` 三个方法在模块化拆分后丢失 `@staticmethod` 装饰器（无 self 亦无装饰器），经 `self.xxx()` 实例调用即 TypeError，且被 write.py 的 try/except 静默吞掉，导致完稿哨兵「检测+自动修订」整条链路不生效。补回 `@staticmethod` 后恢复；已对 Sandbox 全方法做签名级体检 + 全域冒烟通过。
+6. 2026-09-25 风格卡作品级绑定 + 注入/提炼三开关（inject_memory/inject_characters/auto_extract）+ 角色卡提取收紧 0.6/3
+7. 2026-09-25 main.py → handlers/ 包拆分（Mixin 式，56c205b）
+8. 2026-09-21 局部修改优化：正文 mode=revise + 角色卡/大纲说明书模式
+9. 2026-09-21 core.py → core/ 包拆分（Mixin 式）
+10. 2026-09-13 写作体验小部件：章节接续 / 废稿清理 / 口水词哨兵 / 灵感便签

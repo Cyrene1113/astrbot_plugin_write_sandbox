@@ -187,8 +187,8 @@ class MiscMixin:
         Args:
             action(string): info=查看当前作品与记忆概况；switch=切换/新建作品(name 必填)；list=列出所有作品；config=调整作品写作配置(key/value 必填，如 关闭摘要注入 inject_memory=false)。
             name(string): switch 时必填，作品名；config 时可选（不填用当前激活作品）。
-            key(string): config 时必填，配置项：inject_memory(是否注入前文摘要+设定书)、inject_characters(是否注入人设卡+选角)、auto_extract(每章写完是否自动提炼人设卡)、chapter_link(章节接续模式 auto/continuous/break)。
-            value(string): config 时必填，新值：inject_*/auto_extract 用 true/false；chapter_link 用 auto/continuous/break。
+            key(string): config 时必填，配置项：inject_memory(是否注入前文摘要+设定书)、inject_characters(是否注入人设卡+选角)、auto_extract(每章写完是否自动提炼人设卡)、chapter_link(章节接续模式 auto/continuous/break)、use_beats(有大纲时自动场景beat分节)、inject_char_budget(注入字符预算)。
+            value(string): config 时必填，新值：inject_*/auto_extract 用 true/false；chapter_link 用 auto/continuous/break；use_beats 用 true/false、inject_char_budget 用整数。
         """
         sandbox = self._get_sandbox(event)
         if not sandbox:
@@ -199,26 +199,34 @@ class MiscMixin:
             if not target:
                 return "调整配置需要先指定作品（name 参数）或先激活一个作品。"
             if not key.strip():
-                return "config 需要指定配置项 key：inject_memory / inject_characters / auto_extract / chapter_link。"
+                return "config 需要指定配置项 key：inject_memory / inject_characters / auto_extract / chapter_link / use_beats / inject_char_budget。"
             k = key.strip().lower()
             cfg = sandbox.load_story_config(target)
             if k not in cfg:
-                return f"未知配置项「{k}」。可用：inject_memory、inject_characters、auto_extract、chapter_link。"
+                return f"未知配置项「{k}」。可用：inject_memory、inject_characters、auto_extract、chapter_link、use_beats、inject_char_budget。"
             v = value.strip().lower()
             if k == "chapter_link":
                 if v not in ("auto", "continuous", "break"):
                     return "chapter_link 取值：auto（自动）/ continuous（连续叙事贴上一章结尾）/ break（断章收尾只给氛围引子）。"
                 cfg[k] = v
             else:
-                if v not in ("true", "false", "1", "0", "开", "关", "是", "否"):
+                if k == "inject_char_budget":
+                    try:
+                        cfg[k] = int(value.strip())
+                    except ValueError:
+                        return "inject_char_budget 需要整数。"
+                elif v not in ("true", "false", "1", "0", "开", "关", "是", "否"):
                     return f"{k} 需要 true/false（或 开/关）。"
-                cfg[k] = v in ("true", "1", "开", "是")
+                else:
+                    cfg[k] = v in ("true", "1", "开", "是")
             sandbox.save_story_config(target, cfg)
             label = {
                 "inject_memory": "前文摘要+设定书注入",
                 "inject_characters": "人设卡+选角注入",
                 "auto_extract": "每章自动提炼人设卡",
                 "chapter_link": "章节接续模式",
+                "use_beats": "场景beat细纲分节",
+                "inject_char_budget": "注入字符预算",
             }.get(k, k)
             return f"《{target}》配置已更新：{label} → {cfg[k]}"
 
