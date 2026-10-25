@@ -7,7 +7,8 @@ import re
 from pathlib import Path
 from typing import Any, Optional
 
-from .constants import CHAPTERS_DIR_NAME, CHAPTER_SUMMARIES_FILE, DEFAULT_STORY_CONFIG, DEFAULT_STORY_STATE, DRAFTS_DIR_NAME, OUTLINE_FILE, PENDING_OUTLINE_FILE, STORY_CONFIG_FILE, STORY_CONSTRAINTS_FILE, STORY_STATE_FILE, _LOCK, _safe_title
+from .constants import ARC_SUMMARIES_FILE, CHAPTERS_DIR_NAME, CHAPTER_SUMMARIES_FILE, DEFAULT_STORY_CONFIG, DEFAULT_STORY_STATE, DRAFTS_DIR_NAME, OUTLINE_FILE, PENDING_OUTLINE_FILE, STORY_CONFIG_FILE, STORY_CONSTRAINTS_FILE, STORY_STATE_FILE, _LOCK, _safe_title
+from .inject import pick_to_archive
 
 
 class WorksMixin:
@@ -320,6 +321,67 @@ class WorksMixin:
         work_c = self.load_work_constraints(work) if work else {}
         return render_layered(overlay_constraints(self.constraints, work_c))
 
+    # ── 场景 beat（P3）──────────────────────────
+    def get_chapter_beats(self, work: str, ch: int) -> list[dict[str, Any]]:
+        """读大纲章节节点的 beats；无返回空列表。"""
+        outline = self.load_outline(work)
+        cur = next((it for it in (outline.get("chapters") or [])
+                    if isinstance(it, dict) and int(it.get("ch", 0)) == ch), None)
+        beats = (cur or {}).get("beats")
+        return beats if isinstance(beats, list) else []
+
+    def set_chapter_beats(self, work: str, ch: int, beats: list[dict[str, Any]]) -> None:
+        """把 beat 细纲写进大纲章节节点（覆盖）。"""
+        outline = self.load_outline(work)
+        for it in outline.get("chapters") or []:
+            if isinstance(it, dict) and int(it.get("ch", 0)) == ch:
+                it["beats"] = beats
+                self.save_outline(work, outline)
+                return
+
+    def chapter_character_names(self, work: str, ch: int) -> list[str]:
+        """本章大纲出场角色名列表（focus_chars 用）。"""
+        outline = self.load_outline(work)
+        cur = next((it for it in (outline.get("chapters") or [])
+                    if isinstance(it, dict) and int(it.get("ch", 0)) == ch), None)
+        names = (cur or {}).get("characters")
+        return [str(n).strip() for n in names if str(n).strip()] if isinstance(names, list) else []
+
+    # ── 摘要分层（P3）──────────────────────────
+    def load_arc_summaries(self, work: str) -> list[dict[str, Any]]:
+        f = self.work_dir(work) / ARC_SUMMARIES_FILE
+        if not f.exists():
+            return []
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def save_arc_summary(self, work: str, ch_start: int, ch_end: int, text: str) -> None:
+        arcs = self.load_arc_summaries(work)
+        arcs = [a for a in arcs if not (a.get("ch_start") == ch_start and a.get("ch_end") == ch_end)]
+        arcs.append({"ch_start": ch_start, "ch_end": ch_end, "text": text})
+        arcs.sort(key=lambda a: int(a.get("ch_start", 0)))
+        with _LOCK:
+            (self.work_dir(work) / ARC_SUMMARIES_FILE).write_text(
+                json.dumps(arcs, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def pick_to_archive(self, work: str, keep: int = 5, threshold: int = 8) -> list[int]:
+        items = self.load_chapter_summaries(work)
+        unarch = [int(it.get("ch", 0)) for it in items if not it.get("archived")]
+        return pick_to_archive(unarch, keep, threshold)
+
+    def mark_summaries_archived(self, work: str, chs: list[int]) -> None:
+        items = self.load_chapter_summaries(work)
+        hit = {int(c) for c in chs}
+        for it in items:
+            if int(it.get("ch", 0)) in hit:
+                it["archived"] = True
+        with _LOCK:
+            (self.work_dir(work) / CHAPTER_SUMMARIES_FILE).write_text(
+                json.dumps({"summaries": items}, ensure_ascii=False, indent=2), encoding="utf-8")
+
     def get_chapter_link_mode(self, work: str) -> str:
         return self.load_story_config(work).get("chapter_link", "auto")
 
@@ -519,27 +581,36 @@ class WorksMixin:
         self.delete_draft(work, draft_id)
         return path
 
-    def render_story_memory(self, work: str, summary_limit: int = 300) -> str:
-        """拼接当前作品的摘要流水 + 设定书快照，用于写新章时注入。"""
+    def render_story_memory(self, work: str, summary_limit: int = 300,
+                            focus_chars: Optional[list[str]] = None) -> str:
+        """拼接作品记忆：弧线摘要（已归档）+ 近章全量摘要（未归档）+ 设定书快照。
+        focus_chars 非空时设定书 characters 只详列焦点角色，其余一行带过；world 值截断 200 字。"""
         items = self.load_chapter_summaries(work)
         lines = [f"【以下记忆仅属于《{work}》，禁止引入其他作品内容】"]
-        if items:
-            lines.append("——逐章摘要——")
-            for it in items:
+        arcs = self.load_arc_summaries(work)
+        if arcs:
+            lines.append("——弧线摘要（早期章节归档）——")
+            for a in arcs:
+                lines.append(f"[第{a.get('ch_start')}~{a.get('ch_end')}章] {a.get('text', '')}")
+        unarch = [it for it in items if not it.get("archived")]
+        if unarch:
+            lines.append("——近章摘要——")
+            for it in unarch:
                 s = str(it.get("summary", ""))
                 if len(s) > summary_limit:
                     s = s[:summary_limit] + "…"
                 lines.append(f"[第{it.get('ch')}章] {s}")
-        else:
+        elif not arcs:
             lines.append("（还没有章节摘要）")
         state = self.load_story_state(work)
-        state_lines = self._render_state(state)
+        state_lines = self._render_state(state, focus_chars)
         if state_lines:
             lines.append("——设定书（当前状态快照）——")
             lines.extend(state_lines)
         return "\n".join(lines)
 
-    def _render_state(self, state: dict[str, Any]) -> list[str]:
+    def _render_state(self, state: dict[str, Any],
+                      focus_chars: Optional[list[str]] = None) -> list[str]:
         lines: list[str] = []
         meta = state.get("meta") or {}
         if not isinstance(meta, dict):
@@ -549,14 +620,24 @@ class WorksMixin:
         world = state.get("world") or {}
         if isinstance(world, dict):
             for k, v in world.items():
+                v = str(v)
+                if len(v) > 200:
+                    v = v[:200] + "…"
                 lines.append(f"世界观·{k}：{v}")
         chars = state.get("characters") or []
         if isinstance(chars, list):
+            focus = {str(f).strip() for f in (focus_chars or []) if str(f).strip()}
             for c in chars:
-                if isinstance(c, dict):
-                    parts = [str(c.get(k, "")) for k in ("name", "状态", "关系", "秘密") if c.get(k)]
-                    if parts:
-                        lines.append("角色：" + "｜".join(parts))
+                if not isinstance(c, dict):
+                    continue
+                name = str(c.get("name") or "").strip()
+                if focus and name and name not in focus \
+                        and not any(f in name or name in f for f in focus):
+                    lines.append(f"角色：{name}（非本章焦点，略）")
+                    continue
+                parts = [str(c.get(k, "")) for k in ("name", "状态", "关系", "秘密") if c.get(k)]
+                if parts:
+                    lines.append("角色：" + "｜".join(parts))
         fsh = state.get("foreshadowing") or []
         if isinstance(fsh, list):
             for f in fsh:

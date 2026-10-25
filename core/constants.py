@@ -65,6 +65,7 @@ PENDING_OUTLINE_FILE = "outline.pending.json"
 ACTIVE_WORK_FILE = "active_work.json"
 STORY_CONFIG_FILE = "story_config.json"
 STORY_CONSTRAINTS_FILE = "story_constraints.json"
+ARC_SUMMARIES_FILE = "arc_summaries.json"
 
 DEFAULT_STORY_CONFIG: dict[str, Any] = {
     "chapter_link": "auto",  # auto 自动 / continuous 连续叙事 / break 断章收尾
@@ -73,6 +74,8 @@ DEFAULT_STORY_CONFIG: dict[str, Any] = {
     "inject_characters": True,  # 是否注入「本章出场人设卡 + 全局卡选角」
     # 每章写完是否自动提炼人设卡（默认关：只给多章累计反复出现的角色建卡）
     "auto_extract": False,
+    "use_beats": True,  # 有大纲章节点时自动展开场景 beat 驱动分节（P3）
+    "inject_char_budget": 12000,  # story_context 注入字符预算，0=不限制（P3）
 }
 
 DEFAULT_STORY_STATE: dict[str, Any] = {
