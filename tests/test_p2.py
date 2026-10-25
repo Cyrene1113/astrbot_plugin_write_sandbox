@@ -12,7 +12,9 @@ from core import Sandbox
 
 def test_pronoun():
     s = pronoun_stats("他看她。她看他。" * 50)  # 200 字 200 次
-    assert s["he"] == 100 and s["she"] == 100 and s["per_kilo"] == 500.0
+    assert s["he"] == 100 and s["she"] == 100 and s["you"] == 0 and s["per_kilo"] == 500.0
+    s2 = pronoun_stats("你看他，他看你。" * 40)  # 320 字，你×80 他×80
+    assert s2["you"] == 80 and s2["he"] == 80 and s2["per_kilo"] == 500.0
     assert pronoun_stats("短")["total_chars"] < 100
 
 

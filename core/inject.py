@@ -28,9 +28,7 @@ def assemble_injection(parts: list[tuple[int, str, str]], budget: int) -> str:
             kept.append((name, text[: max(200, budget - 10)] + _CUT_MARK))
             used = budget
             continue
-        # 超预算：此项丢弃；若它是剩余项里优先级最低的，标记截断事实
-        rest = [(p, n) for p, n, _ in items if (n, _) not in [(k[0], k[1]) for k in kept]]
-        # 简化：直接注明省略来源名
+        # 超预算：此项丢弃；直接注明省略来源名（C5：清理无用的 rest 死代码）
         dropped = [n for p, n, t in items if t.strip() and (n not in [k[0] for k in kept])]
         tail = f"\n…（因注入预算省略：{'、'.join(dict.fromkeys(dropped))}）…"
         base = "\n\n".join(t for _n, t in kept)

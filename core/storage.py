@@ -234,6 +234,14 @@ class StorageMixin:
             path.write_text(merged, encoding="utf-8")
         return path
 
+    def append_output_by_path(self, path: Path, text: str) -> Path:
+        """向既有产出文件追加（短篇分节复用同一文件，断点续跑才能读到完整内容）。"""
+        with _LOCK:
+            existing = path.read_text(encoding="utf-8") if path.exists() else ""
+            merged = (existing.rstrip() + "\n\n" + text) if existing.strip() else text
+            path.write_text(merged, encoding="utf-8")
+        return path
+
     def latest_output_path(self) -> Optional[Path]:
         files = sorted(self.outputs_dir.glob("*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)
         return files[0] if files else None

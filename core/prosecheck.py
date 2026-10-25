@@ -24,15 +24,16 @@ _SUBLIMATION_PATTERNS = (
 
 
 def pronoun_stats(text: str) -> dict[str, Any]:
-    """他/她 代词密度（次/千字）。advisory 指标，不自动改。"""
+    """人称代词密度（次/千字）：他/她/你 都计。advisory 指标，不自动改。"""
     clean = re.sub(r"\s+", "", text or "")
     total = len(clean)
     if total < 100:
-        return {"total_chars": total, "he": 0, "she": 0, "per_kilo": 0.0}
+        return {"total_chars": total, "he": 0, "she": 0, "you": 0, "per_kilo": 0.0}
     he = clean.count("他")
     she = clean.count("她")
-    return {"total_chars": total, "he": he, "she": she,
-            "per_kilo": round((he + she) * 1000 / total, 1)}
+    you = clean.count("你")
+    return {"total_chars": total, "he": he, "she": she, "you": you,
+            "per_kilo": round((he + she + you) * 1000 / total, 1)}
 
 
 def detect_sublimation(text: str) -> list[dict[str, Any]]:

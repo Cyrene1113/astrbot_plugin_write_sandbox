@@ -93,6 +93,14 @@ class CharacterMixin:
                     f"两张卡都要存在才能合并（{name.strip()}={'有' if primary else '无'}，"
                     f"{merge_from.strip()}={'有' if secondary else '无'}）。"
                 )
+            # 跨 scope 校验（C4）：两卡须在同一存储范围，否则被并卡删除会落空
+            p_scope = "work" if sandbox.load_character(name.strip(), active, work_only=True) is not None else "global"
+            s_scope = "work" if sandbox.load_character(merge_from.strip(), active, work_only=True) is not None else "global"
+            if p_scope != s_scope:
+                return (
+                    f"两张卡不在同一存储范围，无法合并（「{name.strip()}」在{p_scope}，"
+                    f"「{merge_from.strip()}」在{s_scope}）。请先调整到同一 scope 再试。"
+                )
             from ..core.cardops import merge_cards, normalize_card
             primary, _ = normalize_card(primary)
             secondary, _ = normalize_card(secondary)
@@ -119,9 +127,13 @@ class CharacterMixin:
                 return "update 需要指定角色名。"
             if not description.strip():
                 return "update 需要写明要改哪些字段，例如「删除称呼方式；口头禅改为 不必。」"
-            old = sandbox.load_character(name.strip(), active)
+            # 按 scope 精确查卡（B1 踩坑）：scope=global 时不再被同名作品卡抢先匹配
+            lookup_work = active if scope == "work" else ""
+            old = sandbox.load_character(name.strip(), lookup_work, work_only=(scope == "work"))
             if old is None:
-                return f"找不到角色「{name.strip()}」的旧卡，无法走纯代码更新。"
+                hint = "（注意：同名卡可能存在于另一个 scope，可先 action=view 确认）" \
+                    if sandbox.find_character_by_identity(name.strip(), active) else ""
+                return f"在 {scope} 范围内找不到角色「{name.strip()}」的旧卡，无法走纯代码更新。{hint}"
             ok, card, changes = sandbox.apply_character_edit(old, description)
             if not ok:
                 return (

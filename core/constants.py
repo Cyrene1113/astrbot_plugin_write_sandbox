@@ -7,7 +7,9 @@ from typing import Any
 
 DEFAULT_CONSTRAINTS: dict[str, Any] = {
     "length": "按指令要求，未明确指定时 800~1500 字",
-    "perspective": "第二人称主视角",
+    # 默认不锁定人称：跟随风格卡 person_habit 与本章指令；两者都没给再按第三人称。
+    # （旧默认「第二人称主视角」会压过第三人称的风格卡，真机实测导致人称失控）
+    "perspective": "跟随风格卡与本章指令；都未指定时用第三人称",
     "scale": "露骨",  # 暧昧 / 露骨 / 极限
     "banned_words": [],
     "description_focus": "感官细节六成、心理三成、动作与环境一成",

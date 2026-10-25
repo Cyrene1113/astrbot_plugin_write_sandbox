@@ -331,13 +331,17 @@ class WorksMixin:
         return beats if isinstance(beats, list) else []
 
     def set_chapter_beats(self, work: str, ch: int, beats: list[dict[str, Any]]) -> None:
-        """把 beat 细纲写进大纲章节节点（覆盖）。"""
+        """把 beat 细纲写进大纲章节节点（覆盖）；节点不存在时创建最小节点——
+        写「大纲没有的章号」时 beats 也能落盘，断点续跑才能复读同一份细纲。"""
         outline = self.load_outline(work)
         for it in outline.get("chapters") or []:
             if isinstance(it, dict) and int(it.get("ch", 0)) == ch:
                 it["beats"] = beats
                 self.save_outline(work, outline)
                 return
+        outline.setdefault("chapters", []).append({"ch": ch, "beats": beats})
+        outline["chapters"].sort(key=lambda it: int(it.get("ch", 0)) if isinstance(it, dict) else 0)
+        self.save_outline(work, outline)
 
     def chapter_character_names(self, work: str, ch: int) -> list[str]:
         """本章大纲出场角色名列表（focus_chars 用）。"""

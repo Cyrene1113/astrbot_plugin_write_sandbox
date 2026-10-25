@@ -346,6 +346,8 @@ class WriteMixin:
             "resume_from": int(rec.get("section_idx") or 0),
             "resume_total": int(rec.get("section_total") or 0),
             "_target_chars": int(rec.get("target_chars") or 0),
+            # 短篇续跑接回原产出文件继续追加（work 模式走草稿，不需要）
+            "_short_path": (rec.get("file_path") or "") if not rec.get("work") else "",
         }
         self._jobs[uid] = job
         job["task"] = asyncio.create_task(self._run_write_job(job))
@@ -423,7 +425,13 @@ class WriteMixin:
                     # 写作期间先落到独立暂存区（drafts/），不占正式章节号
                     file_path = sandbox.append_draft(work, job["job_id"], chunk, tag=tag or instruction)
                 else:
-                    file_path = sandbox.append_output(chunk, tag=tag or instruction)
+                    # 短篇分节复用同一产出文件：断点续跑能读到完整已写内容（交接 C3）
+                    sp = job.get("_short_path")
+                    if sp:
+                        file_path = sandbox.append_output_by_path(Path(sp), chunk)
+                    else:
+                        file_path = sandbox.save_output(chunk, tag=tag or instruction)
+                        job["_short_path"] = str(file_path)
                 job["file_path"] = str(file_path)
                 if i == 1:
                     sandbox.append_history("user", instruction)
@@ -431,10 +439,14 @@ class WriteMixin:
                 parts_written.append(chunk)
                 job["section_idx"] = i
                 self._persist_job(job)
-                # 剧情驱动：每节写完判断是否自然收尾；收尾或触顶即停，否则自动新增一节
-                if ended_mark is None:
-                    ended_mark = await self._check_story_ended(job, chunk)
                 job["section_total"] = i
+                # beat 非末拍：不收章、也不花一次收尾判断（C1；配合 _write_section 只在末拍询问标记）
+                if beats and i < len(beats):
+                    if ended_mark:
+                        logger.info(f"[沙盒] beat 第 {i}/{len(beats)} 拍提前输出收尾标记，忽略并继续下一拍")
+                    ended_mark = False
+                elif ended_mark is None:
+                    ended_mark = await self._check_story_ended(job, chunk)
                 if ended_mark or i >= self._MAX_SECTIONS:
                     break
                 i += 1
@@ -570,7 +582,7 @@ class WriteMixin:
                         "find 必须逐字存在且全文唯一；最多 8 条。\n\n"
                         f"【检出的段尾句】\n{bundle}\n\n【全文】\n{checked_text[:20000]}"
                     )
-                    raw = await self._llm_chat(prompt, system_prompt="你只输出 JSON 数组，不要输出任何其他文字。")
+                    raw = await self._llm_chat(prompt, system_prompt="你只输出 JSON 数组，不要输出任何其他文字。", timeout=120.0)
                     edits = self._parse_edit_json(self._clean(raw))
                     if edits:
                         new_text, applied, _sk = self._apply_edits(checked_text, edits)
@@ -714,11 +726,14 @@ class WriteMixin:
                 )
             else:
                 section_note += "\n- 最后一节：在保持风格的前提下把整篇收束完整。"
-        # 剧情收尾标记：每节都要求，系统据此决定是否自动新增下一节
-        section_note += (
-            "\n- 本节正文写完后，另起一行单独输出状态标记（不要混进正文）："
-            "剧情已经自然收尾就输出【STORY_END】，还没收尾就输出【STORY_CONTINUE】。"
-        )
+        # 剧情收尾标记：beat 非末拍不询问收尾（防某拍 STORY_END 提前收章；末拍恢复询问）
+        if beat is not None and idx < len(beats):
+            section_note += "\n- 本拍写完直接停笔，不要输出任何剧情状态标记。"
+        else:
+            section_note += (
+                "\n- 本节正文写完后，另起一行单独输出状态标记（不要混进正文）："
+                "剧情已经自然收尾就输出【STORY_END】，还没收尾就输出【STORY_CONTINUE】。"
+            )
 
         if idx == 1:
             if mode == "continue":
@@ -1179,7 +1194,9 @@ class WriteMixin:
 
     async def _ensure_chapter_beats(self, sandbox: Sandbox, work: str, ch: int,
                                     instruction: str) -> list[dict]:
-        """取/生成本章 beat 细纲。已有直接返回；无大纲节点或无 plot_points 返回 []。"""
+        """取/生成本章 beat 细纲。已有直接返回；无大纲脉络时返回 []。
+        大纲没有精确章号节点时仍可展开（上下文取最近节点，真机验证有效），
+        落盘由 set_chapter_beats 负责建节点。"""
         stored = sandbox.get_chapter_beats(work, ch)
         if stored:
             return stored
