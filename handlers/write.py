@@ -45,7 +45,7 @@ class WriteMixin:
     async def sandbox_write(
         self,
         event: AstrMessageEvent,
-        instruction: str,
+        instruction: str = "",
         mode: str = "generate",
         tag: str = "",
         work: str = "",
@@ -70,7 +70,7 @@ class WriteMixin:
             tag(string): 可选，给这段文字起个名字，会用在文件名上。
             work(string): 可选，长篇作品名。传入则切换/新建该作品工作区；留空沿用当前激活作品。
             chapter(int): 可选，目标章节号。rewrite 指定章节（如重写第8章→8）或 generate 指定位置时用；0=自动判断。
-            resume(string): 可选，断点续跑：传上次中断的任务号（如 job3），从断点继续写，已写内容保留。
+            resume(string): 可选，断点续跑：传上次中断的任务号（如 job3），从断点继续写，已写内容保留。resume 时可省略 instruction。
         """
         sandbox = self._get_sandbox(event)
         if not sandbox:
