@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any, Optional
 
-from .constants import CORE_DIMS, CORE_LABELS, _LOCK
+from .constants import CORE_DIMS, CORE_LABELS, DEFAULT_STYLE_CARD, _LOCK
 
 
 class StyleMixin:
@@ -242,3 +242,23 @@ class StyleMixin:
         if extras:
             lines.append(f"- 单篇特色样本 ×{len(extras)}（按需调用）")
         return "\n".join(lines) if lines else "（风格卡为空）"
+
+    def render_style_fewshot(self, work: str = "", max_chars: int = 500) -> str:
+        """取高权重示例段第一段（≤max_chars）作风格示范；无 samples 返回空串。"""
+        card = self._scope_style_card(work)
+        combo = self._scope_combo(work)
+        sample = ""
+        if combo.get("cards"):
+            for c in combo["cards"]:
+                cd = self.load_style_card_by_name(c, work)
+                if cd and cd.get("samples"):
+                    sample = str(cd["samples"][0])
+                    break
+        if not sample and card.get("samples"):
+            sample = str(card["samples"][0])
+        sample = sample.strip()
+        if not sample:
+            return ""
+        if len(sample) > max_chars:
+            sample = sample[:max_chars] + "…"
+        return f"【风格示范】（模仿此段笔法，不复制内容）\n{sample}"
